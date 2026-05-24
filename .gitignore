@@ -4,3 +4,4 @@ datasets
 frames_for_3d
 *.pyc
 TASK_PROCESS.md
+*.pt
