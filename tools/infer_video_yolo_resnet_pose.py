@@ -15,7 +15,7 @@ def train(*_args, **_kwargs):
     pass
 
 
-def yolo_rois(detector, frame, conf, iou, max_rois):
+def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad):
     results = detector.predict(frame, conf=conf, iou=iou, max_det=max_rois, verbose=False)
     if not results:
         return []
@@ -30,7 +30,7 @@ def yolo_rois(detector, frame, conf, iou, max_rois):
     for idx in order[:max_rois]:
         x1, y1, x2, y2 = xyxy[idx]
         bw, bh = x2 - x1, y2 - y1
-        pad = 0.18 * max(bw, bh)
+        pad = roi_pad * max(bw, bh)
         x1 = int(max(0, np.floor(x1 - pad)))
         y1 = int(max(0, np.floor(y1 - pad)))
         x2 = int(min(w - 1, np.ceil(x2 + pad)))
@@ -69,7 +69,7 @@ def draw_frame_points(frame, full_pts, bbox, roi_id, det_score=None):
         px, py = int(round(px)), int(round(py))
         cv2.circle(frame, (px, py), 6, (0, 255, 255), -1)
         cv2.putText(frame, f'{roi_id}:{i}', (px + 6, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+    edges = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)]
     for a, b in edges:
         pa = tuple(np.round(full_pts[a]).astype(int))
         pb = tuple(np.round(full_pts[b]).astype(int))
@@ -109,7 +109,7 @@ def infer(args):
                 frame_idx += 1
                 continue
             vis = frame.copy()
-            rois = yolo_rois(detector, frame, args.det_conf, args.det_iou, args.max_rois)
+            rois = yolo_rois(detector, frame, args.det_conf, args.det_iou, args.max_rois, args.roi_pad)
             per_frame = []
             for roi_id, (det_score, x1, y1, x2, y2) in enumerate(rois):
                 crop = frame[y1:y2 + 1, x1:x2 + 1]
@@ -148,6 +148,7 @@ def infer(args):
         'min_kpt_conf': float(np.min(conf_stats)) if conf_stats else 0.0,
         'max_kpt_conf': float(np.max(conf_stats)) if conf_stats else 0.0,
         'max_rois': args.max_rois,
+        'roi_pad': args.roi_pad,
         'backbone': args.backbone,
     }
     Path(args.out).with_suffix('.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -162,6 +163,7 @@ def main():
     ap.add_argument('--out', default='runs/corner_resnet18_aug_roi/head_left_rgb_raw_yolo_conf025_pose.mp4')
     ap.add_argument('--det-conf', type=float, default=0.25)
     ap.add_argument('--det-iou', type=float, default=0.5)
+    ap.add_argument('--roi-pad', type=float, default=0.08)
     ap.add_argument('--max-rois', type=int, default=2)
     ap.add_argument('--stride', type=int, default=3)
     ap.add_argument('--max-frames', type=int, default=300)

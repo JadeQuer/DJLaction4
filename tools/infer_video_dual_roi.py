@@ -54,7 +54,7 @@ def draw_roi_prediction(frame, pts, conf, bbox, roi_id):
         px, py = int(round(px)), int(round(py))
         cv2.circle(frame, (px, py), 8, (0, 255, 255), -1)
         cv2.putText(frame, f'{roi_id}:{i}', (px + 7, py - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    edges = [(0,1),(0,2),(0,4),(3,1),(3,2),(3,7),(5,1),(5,4),(5,7),(6,2),(6,4),(6,7)]
+    edges = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)]
     for a, b in edges:
         pa = tuple(np.round(full_pts[a]).astype(int))
         pb = tuple(np.round(full_pts[b]).astype(int))

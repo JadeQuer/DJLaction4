@@ -250,7 +250,7 @@ def draw_prediction(frame, pts, conf, heatmap_size=(64, 64), color=(0, 255, 255)
         pts_img.append((px, py))
         cv2.circle(frame, (px, py), 6, color, -1)
         cv2.putText(frame, str(i), (px + 6, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
+    edges = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)]
     for a, b in edges:
         cv2.line(frame, pts_img[a], pts_img[b], (0, 180, 255), 2)
     cv2.putText(frame, f'mean_conf={float(np.mean(conf)):.3f}', (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0,255,0), 3)
@@ -415,8 +415,8 @@ def main():
     p.add_argument('--heatmap-size', type=int, default=64)
     p.add_argument('--sigma', type=float, default=1.8)
     p.add_argument('--roi', action='store_true')
-    p.add_argument('--roi-pad', type=float, default=0.60)
-    p.add_argument('--roi-jitter', type=float, default=0.20)
+    p.add_argument('--roi-pad', type=float, default=0.14)
+    p.add_argument('--roi-jitter', type=float, default=0.06)
     p.add_argument('--augment', action='store_true')
     p.add_argument('--init-ckpt')
     p.add_argument('--no-pretrained', action='store_true')

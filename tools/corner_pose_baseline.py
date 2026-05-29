@@ -193,8 +193,7 @@ def draw_prediction(frame, pts, conf, color=(0, 255, 255)):
         pts_img.append((px, py))
         cv2.circle(frame, (px, py), 8, color, -1)
         cv2.putText(frame, str(i), (px + 7, py - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    # Box edge order for x/y/z binary corner order produced by renderer.
-    edges = [(0,1),(0,2),(0,4),(3,1),(3,2),(3,7),(5,1),(5,4),(5,7),(6,2),(6,4),(6,7)]
+    edges = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)]
     for a, b in edges:
         cv2.line(frame, pts_img[a], pts_img[b], (0, 180, 255), 2)
     cv2.putText(frame, f'mean_conf={float(np.mean(conf)):.3f}', (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0,255,0), 3)
