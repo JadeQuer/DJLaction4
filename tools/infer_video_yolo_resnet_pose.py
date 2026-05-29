@@ -69,7 +69,7 @@ def draw_frame_points(frame, full_pts, bbox, roi_id, det_score=None):
         px, py = int(round(px)), int(round(py))
         cv2.circle(frame, (px, py), 6, (0, 255, 255), -1)
         cv2.putText(frame, f'{roi_id}:{i}', (px + 6, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-    edges = [(0,1),(0,2),(0,4),(3,1),(3,2),(3,7),(5,1),(5,4),(5,7),(6,2),(6,4),(6,7)]
+    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
     for a, b in edges:
         pa = tuple(np.round(full_pts[a]).astype(int))
         pb = tuple(np.round(full_pts[b]).astype(int))

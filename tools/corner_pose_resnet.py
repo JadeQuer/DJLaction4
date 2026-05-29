@@ -250,7 +250,7 @@ def draw_prediction(frame, pts, conf, heatmap_size=(64, 64), color=(0, 255, 255)
         pts_img.append((px, py))
         cv2.circle(frame, (px, py), 6, color, -1)
         cv2.putText(frame, str(i), (px + 6, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-    edges = [(0,1),(0,2),(0,4),(3,1),(3,2),(3,7),(5,1),(5,4),(5,7),(6,2),(6,4),(6,7)]
+    edges = [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]
     for a, b in edges:
         cv2.line(frame, pts_img[a], pts_img[b], (0, 180, 255), 2)
     cv2.putText(frame, f'mean_conf={float(np.mean(conf)):.3f}', (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0,255,0), 3)
@@ -291,6 +291,11 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
     model = ResNetCornerNet(backbone=args.backbone, pretrained=not args.no_pretrained).to(device)
+    if getattr(args, 'init_ckpt', None):
+        ckpt = torch.load(args.init_ckpt, map_location=device)
+        state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+        model.load_state_dict(state, strict=True)
+        print(f'loaded init checkpoint: {args.init_ckpt}')
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best = 1e9
     out = Path(args.out)
@@ -413,6 +418,7 @@ def main():
     p.add_argument('--roi-pad', type=float, default=0.60)
     p.add_argument('--roi-jitter', type=float, default=0.20)
     p.add_argument('--augment', action='store_true')
+    p.add_argument('--init-ckpt')
     p.add_argument('--no-pretrained', action='store_true')
     p.add_argument('--cpu', action='store_true')
     p.set_defaults(func=train)
