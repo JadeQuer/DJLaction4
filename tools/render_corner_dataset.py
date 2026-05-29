@@ -92,6 +92,63 @@ def make_principled_material(name, color, roughness=0.55, emission=None, emissio
     return mat
 
 
+def make_image_emission_material(name, image_path, emission_strength=0.9, roughness=0.18):
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    mat.use_backface_culling = False
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    for node in list(nodes):
+        nodes.remove(node)
+
+    tex = nodes.new(type="ShaderNodeTexImage")
+    tex.image = bpy.data.images.load(str(image_path))
+    bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+    out = nodes.new(type="ShaderNodeOutputMaterial")
+    bsdf.inputs["Roughness"].default_value = roughness
+    if "Emission Strength" in bsdf.inputs:
+        bsdf.inputs["Emission Strength"].default_value = emission_strength
+    links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    if "Emission" in bsdf.inputs:
+        links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
+    elif "Emission Color" in bsdf.inputs:
+        links.new(tex.outputs["Color"], bsdf.inputs["Emission Color"])
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    return mat
+
+
+def add_screen_image_on_zmin_face(obj, image_path, inset=0.08, offset_ratio=0.006):
+    xs = [corner[0] for corner in obj.bound_box]
+    ys = [corner[1] for corner in obj.bound_box]
+    zs = [corner[2] for corner in obj.bound_box]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    minz, maxz = min(zs), max(zs)
+    dx, dy, dz = maxx - minx, maxy - miny, maxz - minz
+    pad_x = dx * inset
+    pad_z = dz * inset
+    z = minz - max(dx, dy, dz) * offset_ratio
+    verts = [
+        (minx + pad_x, miny + dy * inset, z),
+        (minx + pad_x, maxy - dy * inset, z),
+        (maxx - pad_x, maxy - dy * inset, z),
+        (maxx - pad_x, miny + dy * inset, z),
+    ]
+    faces = [(0, 1, 2, 3)]
+    mesh = bpy.data.meshes.new("screenImageMesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for loop, uv in zip(mesh.polygons[0].loop_indices, [(1, 0), (1, 1), (0, 1), (0, 0)]):
+        uv_layer.data[loop].uv = uv
+
+    plane = bpy.data.objects.new("screen_image_zmin_face", mesh)
+    bpy.context.collection.objects.link(plane)
+    plane.parent = obj
+    plane.data.materials.append(make_image_emission_material("screen_image_material", image_path))
+    return plane
+
+
 def add_local_box(obj, name, center, size, mat):
     sx, sy, sz = size
     cx, cy, cz = center
@@ -223,7 +280,7 @@ def bbox_corners_from_info(info):
 
 
 
-def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size, post_effects=False, pad_px=None):
+def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size, post_effects=False, pad_px=None, final_pad_px=None):
     import cv2
 
     img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -233,11 +290,23 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
     h, w = img.shape[:2]
     x1, y1 = pts[:, 0].min(), pts[:, 1].min()
     x2, y2 = pts[:, 0].max(), pts[:, 1].max()
-    pad = float(pad_px) if pad_px is not None else max(x2 - x1, y2 - y1) * pad_ratio
-    x1 = max(0.0, x1 - pad)
-    y1 = max(0.0, y1 - pad)
-    x2 = min(float(w - 1), x2 + pad)
-    y2 = min(float(h - 1), y2 + pad)
+    box_w = max(1.0, float(x2 - x1))
+    box_h = max(1.0, float(y2 - y1))
+    if final_pad_px is not None:
+        final_pad = max(0.0, min(float(final_pad_px), (out_size - 1) * 0.45))
+        target_content = max(1.0, out_size - final_pad * 2.0)
+        crop_w_target = box_w * out_size / target_content
+        crop_h_target = box_h * out_size / target_content
+        pad_x = max(0.0, (crop_w_target - box_w) * 0.5)
+        pad_y = max(0.0, (crop_h_target - box_h) * 0.5)
+    else:
+        pad = float(pad_px) if pad_px is not None else max(box_w, box_h) * pad_ratio
+        pad_x = pad
+        pad_y = pad
+    x1 = max(0.0, x1 - pad_x)
+    y1 = max(0.0, y1 - pad_y)
+    x2 = min(float(w - 1), x2 + pad_x)
+    y2 = min(float(h - 1), y2 + pad_y)
     x1i, y1i = int(math.floor(x1)), int(math.floor(y1))
     x2i, y2i = int(math.ceil(x2)), int(math.ceil(y2))
     crop = img[y1i:y2i + 1, x1i:x2i + 1]
@@ -266,6 +335,7 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
         "crop_height": int(crop_h),
         "scale_x": float(sx),
         "scale_y": float(sy),
+        "final_pad_px": None if final_pad_px is None else float(final_pad_px),
     }
     return transformed, crop_info
 
@@ -362,6 +432,30 @@ def add_reflection_strip_lights(scale=1.0):
         lights.append(light)
     return lights
 
+
+def enable_cycles_gpu(device_type="OPTIX"):
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    for candidate in (device_type, "CUDA"):
+        try:
+            prefs.compute_device_type = candidate
+            prefs.get_devices()
+            enabled = []
+            for device in prefs.devices:
+                use_device = device.type != "CPU"
+                device.use = use_device
+                if use_device:
+                    enabled.append(device.name)
+            if enabled:
+                bpy.context.scene.cycles.device = "GPU"
+                print(f"Cycles GPU enabled ({candidate}): {', '.join(enabled)}")
+                return True
+        except Exception as exc:
+            print(f"Cycles GPU setup failed for {candidate}: {exc}")
+    bpy.context.scene.cycles.device = "CPU"
+    print("Cycles GPU unavailable; falling back to CPU")
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-dir", default=Path("datasets/dji_action4"), type=Path)
@@ -375,11 +469,15 @@ def main():
     parser.add_argument("--crop-size", default=1024, type=int)
     parser.add_argument("--crop-pad", default=0.02, type=float)
     parser.add_argument("--crop-pad-px", default=None, type=float)
+    parser.add_argument("--final-pad-px", default=None, type=float)
     parser.add_argument("--target-diameter", default=120.0, type=float)
     parser.add_argument("--add-decals", action="store_true")
+    parser.add_argument("--screen-image", default=None, type=Path)
+    parser.add_argument("--screen-image-inset", default=0.08, type=float)
     parser.add_argument("--post-effects", action="store_true")
     parser.add_argument("--dof", action="store_true")
     parser.add_argument("--engine", default="cycles", choices=["eevee", "cycles"])
+    parser.add_argument("--cycles-device", default="OPTIX", choices=["OPTIX", "CUDA"])
     parser.add_argument("--ambient-strength", default=0.92, type=float)
     parser.add_argument("--exposure", default=-0.18, type=float)
     parser.add_argument("--gamma", default=1.08, type=float)
@@ -409,6 +507,7 @@ def main():
         scene.render.engine = "CYCLES"
         scene.cycles.samples = args.samples
         scene.cycles.use_denoising = True
+        enable_cycles_gpu(args.cycles_device)
     else:
         scene.render.engine = "BLENDER_EEVEE"
         scene.eevee.taa_render_samples = 96
@@ -439,6 +538,10 @@ def main():
     if args.add_decals:
         add_photo_decals(obj)
 
+    local_corners = local_bbox_corners(obj)
+    if args.screen_image:
+        add_screen_image_on_zmin_face(obj, args.screen_image, inset=args.screen_image_inset)
+
     cam = setup_camera(args.width, args.height, args.fx, args.fy, args.cx, args.cy)
     add_lights(scale=args.light_scale)
     add_reflection_strip_lights(scale=args.reflection_scale)
@@ -451,7 +554,6 @@ def main():
     color_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
 
-    local_corners = local_bbox_corners(obj)
     all_records = []
 
     idx = 0
@@ -530,6 +632,7 @@ def main():
                 args.crop_size,
                 post_effects=args.post_effects,
                 pad_px=args.crop_pad_px,
+                final_pad_px=args.final_pad_px,
             )
             raw_path.unlink(missing_ok=True)
             x1, y1, _x2, _y2 = crop_info["xyxy"]

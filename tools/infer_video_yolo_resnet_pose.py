@@ -52,16 +52,6 @@ def project_heatmap_points_to_frame(pts, bbox, heatmap_size):
     return np.stack([pts[:, 0] * sx + x1, pts[:, 1] * sy + y1], axis=1)
 
 
-def smooth_points(prev_pts, curr_pts, alpha, max_jump):
-    if prev_pts is None:
-        return curr_pts
-    dist = np.linalg.norm(curr_pts - prev_pts, axis=1)
-    point_alpha = np.full((curr_pts.shape[0], 1), alpha, dtype=np.float32)
-    jump_mask = dist > max_jump
-    point_alpha[jump_mask] = min(alpha, 0.18)
-    return prev_pts * (1.0 - point_alpha) + curr_pts * point_alpha
-
-
 def draw_frame_points(frame, full_pts, bbox, roi_id, det_score=None):
     x1, y1, x2, y2 = bbox
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
@@ -95,11 +85,13 @@ def infer(args):
     out_h = int(round(src_h * out_w / src_w))
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(args.out, cv2.VideoWriter_fourcc(*'mp4v'), fps / args.stride, (out_w, out_h))
+    debug_dir = Path(args.debug_dir) if args.debug_dir else None
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
     frame_idx = written = 0
     conf_stats = []
     det_count_stats = []
-    prev_points = [None for _ in range(args.max_rois)]
     with torch.no_grad():
         while True:
             ok, frame = cap.read()
@@ -119,15 +111,16 @@ def infer(args):
                 logits = model(inp)
                 pts, kpt_conf = decode_heatmaps(logits)
                 full_pts = project_heatmap_points_to_frame(pts[0], (x1, y1, x2, y2), (args.heatmap_size, args.heatmap_size))
-                if args.temporal_smooth:
-                    full_pts = smooth_points(prev_points[roi_id], full_pts, args.smooth_alpha, args.max_point_jump)
-                    prev_points[roi_id] = full_pts.copy()
                 draw_frame_points(vis, full_pts, (x1, y1, x2, y2), roi_id, det_score)
                 per_frame.append(float(np.mean(kpt_conf[0])))
+                if debug_dir is not None and written < args.debug_frames:
+                    cv2.imwrite(str(debug_dir / f'frame_{written:04d}_roi_{roi_id}_crop.png'), crop)
             mean_conf = float(np.mean(per_frame)) if per_frame else 0.0
             det_count_stats.append(len(rois))
             conf_stats.append(mean_conf)
             cv2.putText(vis, f'yolo_rois={len(rois)} mean_kpt_conf={mean_conf:.3f}', (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 0), 3)
+            if debug_dir is not None and written < args.debug_frames:
+                cv2.imwrite(str(debug_dir / f'frame_{written:04d}_vis.png'), vis)
             vis = cv2.resize(vis, (out_w, out_h), interpolation=cv2.INTER_AREA)
             writer.write(vis)
             written += 1
@@ -170,9 +163,8 @@ def main():
     ap.add_argument('--output-width', type=int, default=960)
     ap.add_argument('--image-size', type=int, default=256)
     ap.add_argument('--heatmap-size', type=int, default=64)
-    ap.add_argument('--temporal-smooth', action='store_true')
-    ap.add_argument('--smooth-alpha', type=float, default=0.35)
-    ap.add_argument('--max-point-jump', type=float, default=45.0)
+    ap.add_argument('--debug-dir')
+    ap.add_argument('--debug-frames', type=int, default=24)
     ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34'])
     ap.add_argument('--cpu', action='store_true')
     infer(ap.parse_args())

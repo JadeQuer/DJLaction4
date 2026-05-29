@@ -5,3 +5,5 @@ frames_for_3d
 *.pyc
 TASK_PROCESS.md
 *.pt
+datasets_pre
+runs_pre
