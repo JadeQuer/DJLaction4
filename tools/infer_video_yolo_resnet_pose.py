@@ -15,7 +15,7 @@ def train(*_args, **_kwargs):
     pass
 
 
-def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad):
+def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad, roi_shrink):
     results = detector.predict(frame, conf=conf, iou=iou, max_det=max_rois, verbose=False)
     if not results:
         return []
@@ -29,6 +29,11 @@ def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad):
     order = np.argsort(-scores)
     for idx in order[:max_rois]:
         x1, y1, x2, y2 = xyxy[idx]
+        if roi_shrink > 0:
+            cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+            bw0, bh0 = (x2 - x1) * (1.0 - roi_shrink), (y2 - y1) * (1.0 - roi_shrink)
+            x1, x2 = cx - bw0 * 0.5, cx + bw0 * 0.5
+            y1, y2 = cy - bh0 * 0.5, cy + bh0 * 0.5
         bw, bh = x2 - x1, y2 - y1
         pad = roi_pad * max(bw, bh)
         x1 = int(max(0, np.floor(x1 - pad)))
@@ -44,9 +49,17 @@ def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad):
 
 
 
-def project_heatmap_points_to_frame(pts, bbox, heatmap_size):
+def project_heatmap_points_to_frame(pts, bbox, heatmap_size, input_size=None, letterbox_meta=None):
     x1, y1, x2, y2 = bbox
     hm_w, hm_h = heatmap_size
+    if letterbox_meta is not None and input_size is not None:
+        in_w, in_h = input_size
+        px = pts[:, 0] / float(hm_w) * float(in_w)
+        py = pts[:, 1] / float(hm_h) * float(in_h)
+        scale = max(float(letterbox_meta.get('scale', 1.0)), 1e-6)
+        cx = (px - float(letterbox_meta.get('pad_x', 0.0))) / scale
+        cy = (py - float(letterbox_meta.get('pad_y', 0.0))) / scale
+        return np.stack([cx + x1, cy + y1], axis=1)
     sx = (x2 - x1 + 1) / float(hm_w)
     sy = (y2 - y1 + 1) / float(hm_h)
     return np.stack([pts[:, 0] * sx + x1, pts[:, 1] * sy + y1], axis=1)
@@ -101,16 +114,28 @@ def infer(args):
                 frame_idx += 1
                 continue
             vis = frame.copy()
-            rois = yolo_rois(detector, frame, args.det_conf, args.det_iou, args.max_rois, args.roi_pad)
+            rois = yolo_rois(detector, frame, args.det_conf, args.det_iou, args.max_rois, args.roi_pad, args.roi_shrink)
             per_frame = []
             for roi_id, (det_score, x1, y1, x2, y2) in enumerate(rois):
                 crop = frame[y1:y2 + 1, x1:x2 + 1]
                 if crop.size == 0:
                     continue
-                inp = preprocess_frame(crop, image_size=(args.image_size, args.image_size)).to(device)
+                inp, letterbox_meta = preprocess_frame(
+                    crop,
+                    image_size=(args.image_size, args.image_size),
+                    keep_aspect=not args.stretch_roi,
+                    return_meta=True,
+                )
+                inp = inp.to(device)
                 logits = model(inp)
                 pts, kpt_conf = decode_heatmaps(logits)
-                full_pts = project_heatmap_points_to_frame(pts[0], (x1, y1, x2, y2), (args.heatmap_size, args.heatmap_size))
+                full_pts = project_heatmap_points_to_frame(
+                    pts[0],
+                    (x1, y1, x2, y2),
+                    (args.heatmap_size, args.heatmap_size),
+                    input_size=(args.image_size, args.image_size),
+                    letterbox_meta=None if args.stretch_roi else letterbox_meta,
+                )
                 draw_frame_points(vis, full_pts, (x1, y1, x2, y2), roi_id, det_score)
                 per_frame.append(float(np.mean(kpt_conf[0])))
                 if debug_dir is not None and written < args.debug_frames:
@@ -142,6 +167,8 @@ def infer(args):
         'max_kpt_conf': float(np.max(conf_stats)) if conf_stats else 0.0,
         'max_rois': args.max_rois,
         'roi_pad': args.roi_pad,
+        'roi_shrink': args.roi_shrink,
+        'stretch_roi': args.stretch_roi,
         'backbone': args.backbone,
     }
     Path(args.out).with_suffix('.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -157,12 +184,14 @@ def main():
     ap.add_argument('--det-conf', type=float, default=0.25)
     ap.add_argument('--det-iou', type=float, default=0.5)
     ap.add_argument('--roi-pad', type=float, default=0.08)
+    ap.add_argument('--roi-shrink', type=float, default=0.0)
     ap.add_argument('--max-rois', type=int, default=2)
     ap.add_argument('--stride', type=int, default=3)
     ap.add_argument('--max-frames', type=int, default=300)
     ap.add_argument('--output-width', type=int, default=960)
     ap.add_argument('--image-size', type=int, default=256)
     ap.add_argument('--heatmap-size', type=int, default=64)
+    ap.add_argument('--stretch-roi', action='store_true')
     ap.add_argument('--debug-dir')
     ap.add_argument('--debug-frames', type=int, default=24)
     ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34'])

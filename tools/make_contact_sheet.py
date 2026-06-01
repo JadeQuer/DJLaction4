@@ -16,6 +16,18 @@ DEFAULT_ORDER = [
 ]
 
 
+def collect_images(image_dir):
+    ordered = [image_dir / f"{name}.png" for name in DEFAULT_ORDER]
+    existing_ordered = [path for path in ordered if path.exists()]
+    if existing_ordered:
+        return existing_ordered
+    patterns = ("*.png", "*.jpg", "*.jpeg")
+    paths = []
+    for pattern in patterns:
+        paths.extend(sorted(image_dir.glob(pattern)))
+    return paths
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", required=True, type=Path)
@@ -27,7 +39,8 @@ def main():
     label_h = 34
     pad = 12
     cols = 2
-    rows = (len(DEFAULT_ORDER) + cols - 1) // cols
+    image_paths = collect_images(args.dir)
+    rows = (len(image_paths) + cols - 1) // cols
     sheet_w = cols * args.thumb_width + (cols + 1) * pad
     sheet_h = rows * (args.thumb_height + label_h) + (rows + 1) * pad
     sheet = Image.new("RGB", (sheet_w, sheet_h), (245, 245, 245))
@@ -37,10 +50,8 @@ def main():
     except OSError:
         font = ImageFont.load_default()
 
-    for i, name in enumerate(DEFAULT_ORDER):
-        image_path = args.dir / f"{name}.png"
-        if not image_path.exists():
-            continue
+    for i, image_path in enumerate(image_paths):
+        name = image_path.name
         im = Image.open(image_path).convert("RGB")
         im.thumbnail((args.thumb_width, args.thumb_height), Image.Resampling.LANCZOS)
         row, col = divmod(i, cols)
@@ -50,7 +61,7 @@ def main():
         bg.paste(im, ((args.thumb_width - im.width) // 2, (args.thumb_height - im.height) // 2))
         sheet.paste(bg, (x, y + label_h))
         draw.rectangle((x, y, x + args.thumb_width, y + label_h), fill=(32, 32, 32))
-        draw.text((x + 12, y + 5), f"{name}.png", fill=(255, 255, 255), font=font)
+        draw.text((x + 12, y + 5), name, fill=(255, 255, 255), font=font)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(args.out)

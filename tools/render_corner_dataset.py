@@ -10,6 +10,16 @@ import mathutils
 import numpy as np
 
 
+BIG_SCREEN_IMAGE = Path("/root/autodl-tmp/DJLaction4/image.png")
+SMALL_SCREEN_IMAGE = Path("/root/autodl-tmp/DJLaction4/image2.png")
+BIG_SCREEN_INSET = 0.08
+SMALL_SCREEN_SIDE_RATIO = 0.88
+SMALL_SCREEN_X_MARGIN_RATIO = 0.075
+SMALL_SCREEN_Y_SCALE = 1.0
+SMALL_SCREEN_OVERALL_SCALE = 0.95
+SMALL_SCREEN_OFFSET_RATIO = 0.0015
+
+
 def clear_scene():
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
@@ -149,6 +159,106 @@ def add_screen_image_on_zmin_face(obj, image_path, inset=0.08, offset_ratio=0.00
     return plane
 
 
+def add_front_small_screen_on_zmax_face(
+    obj,
+    image_path,
+    side_ratio=0.88,
+    x_margin_ratio=0.075,
+    y_scale=1.0,
+    overall_scale=0.95,
+    offset_ratio=0.0015,
+):
+    xs = [corner[0] for corner in obj.bound_box]
+    ys = [corner[1] for corner in obj.bound_box]
+    zs = [corner[2] for corner in obj.bound_box]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    minz, maxz = min(zs), max(zs)
+    dx, dy, dz = maxx - minx, maxy - miny, maxz - minz
+    max_dim = max(dx, dy, dz)
+
+    base_width_x = min(dy * side_ratio, dx * 0.42)
+    base_height_y = min(dy * side_ratio * y_scale, dy * 0.96)
+    cx = minx + dx * x_margin_ratio + base_width_x * 0.5
+    cy = (miny + maxy) * 0.5
+    width_x = base_width_x * overall_scale
+    height_y = base_height_y * overall_scale
+    x_lo = cx - width_x * 0.5
+    x_hi = cx + width_x * 0.5
+    y_lo = cy - height_y * 0.5
+    y_hi = cy + height_y * 0.5
+    local_surface_z = []
+    for vertex in obj.data.vertices:
+        x, y, z = vertex.co
+        if x_lo <= x <= x_hi and y_lo <= y <= y_hi:
+            local_surface_z.append(float(z))
+    surface_z = max(local_surface_z) if local_surface_z else maxz
+    z = surface_z + max_dim * offset_ratio
+    verts = [
+        (x_lo, y_lo, z),
+        (x_hi, y_lo, z),
+        (x_hi, y_hi, z),
+        (x_lo, y_hi, z),
+    ]
+    faces = [(0, 1, 2, 3)]
+    mesh = bpy.data.meshes.new("frontSmallScreenImageMesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for loop, uv in zip(mesh.polygons[0].loop_indices, [(1, 0), (0, 0), (0, 1), (1, 1)]):
+        uv_layer.data[loop].uv = uv
+
+    plane = bpy.data.objects.new("front_small_screen_zmax_face", mesh)
+    bpy.context.collection.objects.link(plane)
+    plane.parent = obj
+    plane.data.materials.append(make_image_emission_material("front_small_screen_image_material", image_path, emission_strength=1.05))
+    return plane
+
+
+def add_dji_label_on_ymax_face(obj, text="dji-004", offset_ratio=0.012):
+    xs = [corner[0] for corner in obj.bound_box]
+    ys = [corner[1] for corner in obj.bound_box]
+    zs = [corner[2] for corner in obj.bound_box]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    minz, maxz = min(zs), max(zs)
+    dx, dy, dz = maxx - minx, maxy - miny, maxz - minz
+    max_dim = max(dx, dy, dz)
+    y = maxy + max_dim * offset_ratio
+
+    label_w = dx * 0.36
+    label_h = dz * 0.14
+    cx = minx + dx * 0.56
+    cz = maxz - dz * 0.16
+    verts = [
+        (cx - label_w * 0.5, y, cz - label_h * 0.5),
+        (cx - label_w * 0.5, y, cz + label_h * 0.5),
+        (cx + label_w * 0.5, y, cz + label_h * 0.5),
+        (cx + label_w * 0.5, y, cz - label_h * 0.5),
+    ]
+    mesh = bpy.data.meshes.new("djiLabelMesh")
+    mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+    mesh.update()
+    label = bpy.data.objects.new("dji_label_plate", mesh)
+    bpy.context.collection.objects.link(label)
+    label.parent = obj
+    label.data.materials.append(make_principled_material("dji_label_white", (0.92, 0.92, 0.88, 1.0), roughness=0.55))
+
+    font_curve = bpy.data.curves.new("djiLabelTextCurve", "FONT")
+    font_curve.body = text
+    font_curve.align_x = "CENTER"
+    font_curve.align_y = "CENTER"
+    font_curve.size = label_h * 0.58
+    font_curve.extrude = max_dim * 0.0008
+    txt = bpy.data.objects.new("dji_label_text", font_curve)
+    bpy.context.collection.objects.link(txt)
+    txt.location = (cx, y + max_dim * 0.002, cz)
+    txt.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+    txt.parent = obj
+    txt.data.materials.append(make_principled_material("dji_label_black", (0.045, 0.045, 0.04, 1.0), roughness=0.6))
+    return label, txt
+
+
 def add_local_box(obj, name, center, size, mat):
     sx, sy, sz = size
     cx, cy, cz = center
@@ -280,7 +390,44 @@ def bbox_corners_from_info(info):
 
 
 
-def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size, post_effects=False, pad_px=None, final_pad_px=None):
+def make_random_background(bg_dir, width, height):
+    import cv2
+
+    bg_paths = sorted(Path(bg_dir).glob("*.png")) + sorted(Path(bg_dir).glob("*.jpg"))
+    if not bg_paths:
+        raise RuntimeError(f"No background images found in {bg_dir}")
+    bg = cv2.imread(str(random.choice(bg_paths)), cv2.IMREAD_COLOR)
+    if bg is None:
+        raise RuntimeError(f"Failed to read background image from {bg_dir}")
+    bh, bw = bg.shape[:2]
+    scale = max(width / max(1, bw), height / max(1, bh))
+    resized = cv2.resize(bg, (int(round(bw * scale)), int(round(bh * scale))), interpolation=cv2.INTER_AREA)
+    rh, rw = resized.shape[:2]
+    x = 0 if rw == width else random.randint(0, rw - width)
+    y = 0 if rh == height else random.randint(0, rh - height)
+    crop = resized[y:y + height, x:x + width].copy()
+    if random.random() < 0.45:
+        crop = cv2.GaussianBlur(crop, (3, 3), random.uniform(0.0, 0.7))
+    return crop
+
+
+def composite_on_background(image_path, bg_dir):
+    import cv2
+
+    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"Failed to read rendered image: {image_path}")
+    if img.ndim != 3 or img.shape[2] < 4:
+        return
+    h, w = img.shape[:2]
+    fg = img[:, :, :3].astype(np.float32)
+    alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+    bg = make_random_background(bg_dir, w, h).astype(np.float32)
+    comp = np.clip(fg * alpha + bg * (1.0 - alpha), 0, 255).astype(np.uint8)
+    cv2.imwrite(str(image_path), comp)
+
+
+def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size, post_effects=False, pad_px=None, final_pad_px=None, square_crop=True):
     import cv2
 
     img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -295,23 +442,54 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
     if final_pad_px is not None:
         final_pad = max(0.0, min(float(final_pad_px), (out_size - 1) * 0.45))
         target_content = max(1.0, out_size - final_pad * 2.0)
-        crop_w_target = box_w * out_size / target_content
-        crop_h_target = box_h * out_size / target_content
+        if square_crop:
+            side_target = max(box_w, box_h) * out_size / target_content
+            crop_w_target = side_target
+            crop_h_target = side_target
+        else:
+            crop_w_target = box_w * out_size / target_content
+            crop_h_target = box_h * out_size / target_content
         pad_x = max(0.0, (crop_w_target - box_w) * 0.5)
         pad_y = max(0.0, (crop_h_target - box_h) * 0.5)
     else:
         pad = float(pad_px) if pad_px is not None else max(box_w, box_h) * pad_ratio
         pad_x = pad
         pad_y = pad
-    x1 = max(0.0, x1 - pad_x)
-    y1 = max(0.0, y1 - pad_y)
-    x2 = min(float(w - 1), x2 + pad_x)
-    y2 = min(float(h - 1), y2 + pad_y)
+    x1 = x1 - pad_x
+    y1 = y1 - pad_y
+    x2 = x2 + pad_x
+    y2 = y2 + pad_y
+    if square_crop:
+        side = max(x2 - x1, y2 - y1)
+        cx_box = (x1 + x2) * 0.5
+        cy_box = (y1 + y2) * 0.5
+        x1 = cx_box - side * 0.5
+        x2 = cx_box + side * 0.5
+        y1 = cy_box - side * 0.5
+        y2 = cy_box + side * 0.5
+        if x1 < 0:
+            x2 -= x1
+            x1 = 0.0
+        if y1 < 0:
+            y2 -= y1
+            y1 = 0.0
+        if x2 > w - 1:
+            x1 -= x2 - (w - 1)
+            x2 = float(w - 1)
+        if y2 > h - 1:
+            y1 -= y2 - (h - 1)
+            y2 = float(h - 1)
+    x1 = max(0.0, x1)
+    y1 = max(0.0, y1)
+    x2 = min(float(w - 1), x2)
+    y2 = min(float(h - 1), y2)
     x1i, y1i = int(math.floor(x1)), int(math.floor(y1))
     x2i, y2i = int(math.ceil(x2)), int(math.ceil(y2))
     crop = img[y1i:y2i + 1, x1i:x2i + 1]
     crop_h, crop_w = crop.shape[:2]
     crop = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
+    sx = out_size / max(1.0, float(crop_w))
+    sy = out_size / max(1.0, float(crop_h))
     if post_effects:
         if random.random() < 0.35:
             crop = cv2.GaussianBlur(crop, (3, 3), random.uniform(0.20, 0.45))
@@ -322,8 +500,6 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
             crop_f = np.clip(crop_f + noise, 0, 255)
         crop = crop_f.astype(np.uint8)
     cv2.imwrite(str(out_path), crop)
-    sx = out_size / max(1.0, float(crop_w))
-    sy = out_size / max(1.0, float(crop_h))
     transformed = []
     for x, y, z in corners_2d:
         transformed.append([(x - x1i) * sx, (y - y1i) * sy, z])
@@ -335,6 +511,9 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
         "crop_height": int(crop_h),
         "scale_x": float(sx),
         "scale_y": float(sy),
+        "pad_x": 0.0,
+        "pad_y": 0.0,
+        "square_crop": bool(square_crop),
         "final_pad_px": None if final_pad_px is None else float(final_pad_px),
     }
     return transformed, crop_info
@@ -366,6 +545,28 @@ def sync_camera_softbox(light, camera, target):
     camera_look_at(light, target)
 
 
+def balanced_camera_direction(sample_index, jitter=0.22):
+    """Cycle through a full-sphere view bank so every major side is seen often."""
+    base_dirs = [
+        (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
+        (0, 0, 1), (0, 0, -1),
+        (1, 1, 0), (1, -1, 0), (-1, 1, 0), (-1, -1, 0),
+        (1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1),
+        (1, 0, -1), (-1, 0, -1), (0, 1, -1), (0, -1, -1),
+        (1, 1, 1), (1, -1, 1), (-1, 1, 1), (-1, -1, 1),
+        (1, 1, -1), (1, -1, -1), (-1, 1, -1), (-1, -1, -1),
+    ]
+    v = mathutils.Vector(base_dirs[sample_index % len(base_dirs)])
+    v += mathutils.Vector((
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+    ))
+    if v.length < 1e-6:
+        v = mathutils.Vector((1.0, 0.0, 0.0))
+    return v.normalized()
+
+
 def make_mesh_materials_visible(obj, min_base=0.16):
     # Blender's material preview uses a bright studio HDRI. In scripted renders,
     # pure-black imported PBR bases need a neutral floor to show plastic detail.
@@ -394,7 +595,7 @@ def set_input_if_present(bsdf, names, value):
     return False
 
 
-def enhance_natural_reflections(obj, body_roughness=0.42, glass_roughness=0.16, body_specular=0.58, glass_specular=0.88):
+def enhance_natural_reflections(obj, body_roughness=0.42, glass_roughness=0.16, body_specular=0.58, glass_specular=0.88, body_color_scale=0.45):
     glass_keys = ("boli", "glass", "pbr", "siyin", "screen", "lens")
     for mat in obj.data.materials:
         if not mat or not mat.use_nodes:
@@ -406,6 +607,14 @@ def enhance_natural_reflections(obj, body_roughness=0.42, glass_roughness=0.16, 
         is_glass = any(k in name for k in glass_keys)
         rough = glass_roughness if is_glass else body_roughness
         spec = glass_specular if is_glass else body_specular
+        if not is_glass and "Base Color" in bsdf.inputs:
+            col = bsdf.inputs["Base Color"].default_value
+            bsdf.inputs["Base Color"].default_value = (
+                max(0.010, col[0] * body_color_scale),
+                max(0.010, col[1] * body_color_scale),
+                max(0.009, col[2] * body_color_scale),
+                col[3],
+            )
         if "Roughness" in bsdf.inputs:
             bsdf.inputs["Roughness"].default_value = min(bsdf.inputs["Roughness"].default_value, rough)
         set_input_if_present(bsdf, ("Specular IOR Level", "Specular"), spec)
@@ -462,6 +671,8 @@ def main():
     parser.add_argument("--model", default=Path("/root/autodl-fs/official.glb"), type=Path)
     parser.add_argument("--out-dir", default=Path("datasets/dji_action4_official_glb_gray_mean110"), type=Path)
     parser.add_argument("--num-images", default=32, type=int)
+    parser.add_argument("--start-index", default=0, type=int)
+    parser.add_argument("--append", action="store_true")
     parser.add_argument("--width", default=2048, type=int)
     parser.add_argument("--height", default=1536, type=int)
     parser.add_argument("--crop-output", action="store_true", default=True)
@@ -470,31 +681,36 @@ def main():
     parser.add_argument("--crop-pad", default=0.02, type=float)
     parser.add_argument("--crop-pad-px", default=None, type=float)
     parser.add_argument("--final-pad-px", default=None, type=float)
+    parser.add_argument("--rect-crop-output", action="store_true")
     parser.add_argument("--target-diameter", default=120.0, type=float)
     parser.add_argument("--add-decals", action="store_true")
-    parser.add_argument("--screen-image", default=None, type=Path)
-    parser.add_argument("--screen-image-inset", default=0.08, type=float)
+    parser.add_argument("--dji-label", default=None)
     parser.add_argument("--post-effects", action="store_true")
     parser.add_argument("--dof", action="store_true")
     parser.add_argument("--engine", default="cycles", choices=["eevee", "cycles"])
     parser.add_argument("--cycles-device", default="OPTIX", choices=["OPTIX", "CUDA"])
-    parser.add_argument("--ambient-strength", default=0.92, type=float)
-    parser.add_argument("--exposure", default=-0.18, type=float)
+    parser.add_argument("--ambient-strength", default=0.32, type=float)
+    parser.add_argument("--exposure", default=-0.62, type=float)
     parser.add_argument("--gamma", default=1.08, type=float)
-    parser.add_argument("--material-min-base", default=0.12, type=float)
-    parser.add_argument("--light-scale", default=0.38, type=float)
+    parser.add_argument("--material-min-base", default=0.0, type=float)
+    parser.add_argument("--light-scale", default=0.16, type=float)
     parser.add_argument("--background-level", default=0.60, type=float)
     parser.add_argument("--background-plane", action="store_true")
+    parser.add_argument("--background-dir", default=None, type=Path)
     parser.add_argument("--samples", default=48, type=int)
-    parser.add_argument("--body-roughness", default=0.42, type=float)
-    parser.add_argument("--glass-roughness", default=0.16, type=float)
-    parser.add_argument("--reflection-scale", default=0.45, type=float)
+    parser.add_argument("--body-roughness", default=0.54, type=float)
+    parser.add_argument("--body-color-scale", default=0.035, type=float)
+    parser.add_argument("--glass-roughness", default=0.08, type=float)
+    parser.add_argument("--glass-specular", default=1.0, type=float)
+    parser.add_argument("--reflection-scale", default=0.24, type=float)
     parser.add_argument("--orbit-camera", action="store_true", default=True)
     parser.add_argument("--front-camera", dest="orbit_camera", action="store_false")
+    parser.add_argument("--view-mode", default="balanced_faces", choices=["random_orbit", "balanced_faces"])
+    parser.add_argument("--view-jitter", default=0.22, type=float)
     parser.add_argument("--camera-radius-min", default=270.0, type=float)
     parser.add_argument("--camera-radius-max", default=370.0, type=float)
-    parser.add_argument("--camera-height-min", default=45.0, type=float)
-    parser.add_argument("--camera-height-max", default=135.0, type=float)
+    parser.add_argument("--camera-height-min", default=-190.0, type=float)
+    parser.add_argument("--camera-height-max", default=220.0, type=float)
     parser.add_argument("--fx", default=572.411363389757, type=float)
     parser.add_argument("--fy", default=573.5704328585578, type=float)
     parser.add_argument("--cx", default=325.2611083984375, type=float)
@@ -517,7 +733,7 @@ def main():
         scene.eevee.use_soft_shadows = True
     scene.render.resolution_x = args.width
     scene.render.resolution_y = args.height
-    scene.render.film_transparent = False
+    scene.render.film_transparent = bool(args.background_dir)
     scene.view_settings.view_transform = "Standard"
     scene.view_settings.look = "None"
     scene.view_settings.exposure = args.exposure
@@ -534,13 +750,29 @@ def main():
     normalize_object(obj, target_diameter=args.target_diameter)
     ensure_reasonable_materials(obj)
     make_mesh_materials_visible(obj, min_base=args.material_min_base)
-    enhance_natural_reflections(obj, body_roughness=args.body_roughness, glass_roughness=args.glass_roughness)
+    enhance_natural_reflections(
+        obj,
+        body_roughness=args.body_roughness,
+        glass_roughness=args.glass_roughness,
+        glass_specular=args.glass_specular,
+        body_color_scale=args.body_color_scale,
+    )
     if args.add_decals:
         add_photo_decals(obj)
 
     local_corners = local_bbox_corners(obj)
-    if args.screen_image:
-        add_screen_image_on_zmin_face(obj, args.screen_image, inset=args.screen_image_inset)
+    add_screen_image_on_zmin_face(obj, BIG_SCREEN_IMAGE, inset=BIG_SCREEN_INSET)
+    add_front_small_screen_on_zmax_face(
+        obj,
+        SMALL_SCREEN_IMAGE,
+        side_ratio=SMALL_SCREEN_SIDE_RATIO,
+        x_margin_ratio=SMALL_SCREEN_X_MARGIN_RATIO,
+        y_scale=SMALL_SCREEN_Y_SCALE,
+        overall_scale=SMALL_SCREEN_OVERALL_SCALE,
+        offset_ratio=SMALL_SCREEN_OFFSET_RATIO,
+    )
+    if args.dji_label:
+        add_dji_label_on_ymax_face(obj, text=args.dji_label)
 
     cam = setup_camera(args.width, args.height, args.fx, args.fy, args.cx, args.cy)
     add_lights(scale=args.light_scale)
@@ -555,11 +787,14 @@ def main():
     label_dir.mkdir(parents=True, exist_ok=True)
 
     all_records = []
+    if args.append and (args.out_dir / "labels.json").exists():
+        all_records = json.loads((args.out_dir / "labels.json").read_text(encoding="utf-8"))
 
-    idx = 0
+    idx = int(args.start_index)
+    target_idx = idx + args.num_images
     attempts = 0
     max_attempts = args.num_images * 80
-    while idx < args.num_images and attempts < max_attempts:
+    while idx < target_idx and attempts < max_attempts:
         attempts += 1
         obj.rotation_euler = (random.uniform(-0.45, 0.45), random.uniform(-2.75, 2.75), random.uniform(-0.55, 0.55))
         obj.location = (
@@ -568,7 +803,12 @@ def main():
             random.uniform(-10, 10),
         )
 
-        if args.orbit_camera:
+        sample_no = idx - int(args.start_index)
+        if args.orbit_camera and args.view_mode == "balanced_faces":
+            direction = balanced_camera_direction(sample_no, jitter=args.view_jitter)
+            radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
+            cam.location = obj.location + direction * radius
+        elif args.orbit_camera:
             azimuth = random.uniform(0.0, math.tau)
             radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
             cam.location = obj.location + mathutils.Vector(
@@ -623,6 +863,9 @@ def main():
         cam_fy = args.fy
         cam_cx = args.cx
         cam_cy = args.cy
+        if args.background_dir:
+            composite_on_background(raw_path if args.crop_output else final_path, args.background_dir)
+
         if args.crop_output:
             label_corners, crop_info = crop_render_and_points(
                 raw_path,
@@ -633,6 +876,7 @@ def main():
                 post_effects=args.post_effects,
                 pad_px=args.crop_pad_px,
                 final_pad_px=args.final_pad_px,
+                square_crop=not args.rect_crop_output,
             )
             raw_path.unlink(missing_ok=True)
             x1, y1, _x2, _y2 = crop_info["xyxy"]
@@ -640,8 +884,8 @@ def main():
             cam_height = args.crop_size
             cam_fx = args.fx * crop_info["scale_x"]
             cam_fy = args.fy * crop_info["scale_y"]
-            cam_cx = (args.cx - x1) * crop_info["scale_x"]
-            cam_cy = (args.cy - y1) * crop_info["scale_y"]
+            cam_cx = (args.cx - x1) * crop_info["scale_x"] + crop_info.get("pad_x", 0.0)
+            cam_cy = (args.cy - y1) * crop_info["scale_y"] + crop_info.get("pad_y", 0.0)
 
         record = {
             "image": f"rgb/{stem}.png",

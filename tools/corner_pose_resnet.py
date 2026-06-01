@@ -35,7 +35,30 @@ def bbox_from_points(points, w, h, pad_ratio=0.35, jitter=0.0):
     return [x1, y1, x2, y2]
 
 
-def crop_and_resize(img, bbox, out_size):
+def resize_letterbox(img, out_size, fill=(114, 114, 114)):
+    out_w, out_h = out_size
+    h, w = img.shape[:2]
+    scale = min(out_w / max(1, w), out_h / max(1, h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.full((out_h, out_w, 3), fill, dtype=np.uint8)
+    pad_x = (out_w - new_w) // 2
+    pad_y = (out_h - new_h) // 2
+    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+    meta = {
+        'scale': float(scale),
+        'pad_x': float(pad_x),
+        'pad_y': float(pad_y),
+        'new_w': int(new_w),
+        'new_h': int(new_h),
+        'out_w': int(out_w),
+        'out_h': int(out_h),
+    }
+    return canvas, meta
+
+
+def crop_and_resize(img, bbox, out_size, keep_aspect=True):
     x1, y1, x2, y2 = bbox
     x1i, y1i = int(np.floor(x1)), int(np.floor(y1))
     x2i, y2i = int(np.ceil(x2)), int(np.ceil(y2))
@@ -43,21 +66,43 @@ def crop_and_resize(img, bbox, out_size):
     if crop.size == 0:
         crop = img
         x1, y1, x2, y2 = 0.0, 0.0, float(img.shape[1] - 1), float(img.shape[0] - 1)
-    resized = cv2.resize(crop, out_size, interpolation=cv2.INTER_AREA)
-    return resized, [x1, y1, x2, y2]
+    if keep_aspect:
+        resized, meta = resize_letterbox(crop, out_size)
+    else:
+        resized = cv2.resize(crop, out_size, interpolation=cv2.INTER_AREA)
+        crop_h, crop_w = crop.shape[:2]
+        meta = {
+            'scale_x': out_size[0] / max(1.0, float(crop_w)),
+            'scale_y': out_size[1] / max(1.0, float(crop_h)),
+            'pad_x': 0.0,
+            'pad_y': 0.0,
+            'out_w': int(out_size[0]),
+            'out_h': int(out_size[1]),
+        }
+    return resized, [x1, y1, x2, y2], meta
 
 
 
 def apply_image_augment(img):
     out = img.copy()
+    if np.random.rand() < 0.55:
+        h, w = out.shape[:2]
+        scale = np.random.uniform(0.28, 0.75)
+        small_w = max(24, int(round(w * scale)))
+        small_h = max(24, int(round(h * scale)))
+        interp_down = np.random.choice([cv2.INTER_AREA, cv2.INTER_LINEAR])
+        interp_up = np.random.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC])
+        small = cv2.resize(out, (small_w, small_h), interpolation=interp_down)
+        out = cv2.resize(small, (w, h), interpolation=interp_up)
     if np.random.rand() < 0.8:
-        alpha = np.random.uniform(0.7, 1.35)
-        beta = np.random.uniform(-28.0, 28.0)
+        alpha = np.random.uniform(0.55, 1.45)
+        beta = np.random.uniform(-42.0, 36.0)
         out = np.clip(out.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
     if np.random.rand() < 0.45:
         hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)
-        hsv[:, :, 1] *= np.random.uniform(0.65, 1.45)
-        hsv[:, :, 2] *= np.random.uniform(0.75, 1.25)
+        hsv[:, :, 0] = (hsv[:, :, 0] + np.random.uniform(-8.0, 8.0)) % 180.0
+        hsv[:, :, 1] *= np.random.uniform(0.55, 1.55)
+        hsv[:, :, 2] *= np.random.uniform(0.65, 1.35)
         out = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
     if np.random.rand() < 0.35:
         k = int(np.random.choice([3, 5]))
@@ -92,6 +137,7 @@ class CornerDataset(Dataset):
         roi=False,
         roi_pad=0.60,
         roi_jitter=0.10,
+        keep_aspect=True,
         train=True,
         aug=True,
     ):
@@ -103,6 +149,7 @@ class CornerDataset(Dataset):
         self.roi = roi
         self.roi_pad = roi_pad
         self.roi_jitter = roi_jitter
+        self.keep_aspect = keep_aspect
         self.train = train
         self.aug = aug
         if not self.labels:
@@ -135,13 +182,20 @@ class CornerDataset(Dataset):
                 pad_ratio=self.roi_pad,
                 jitter=self.roi_jitter if self.train else 0.0,
             )
-            img, bbox = crop_and_resize(img, bbox, (self.image_w, self.image_h))
+            img, bbox, resize_meta = crop_and_resize(img, bbox, (self.image_w, self.image_h), keep_aspect=self.keep_aspect)
             x1, y1, x2, y2 = bbox
             crop_w = max(1.0, x2 - x1 + 1.0)
             crop_h = max(1.0, y2 - y1 + 1.0)
             transformed = []
             for x, y, z in corners:
-                transformed.append([(x - x1) / crop_w * self.image_w, (y - y1) / crop_h * self.image_h, z])
+                if self.keep_aspect:
+                    transformed.append([
+                        (x - x1) * resize_meta['scale'] + resize_meta['pad_x'],
+                        (y - y1) * resize_meta['scale'] + resize_meta['pad_y'],
+                        z,
+                    ])
+                else:
+                    transformed.append([(x - x1) / crop_w * self.image_w, (y - y1) / crop_h * self.image_h, z])
             corners = np.array(transformed, dtype=np.float32)
             label_w, label_h = self.image_w, self.image_h
         else:
@@ -233,10 +287,25 @@ def decode_heatmaps(logits, topk=9):
     return np.array(pts, dtype=np.float32), np.array(conf, dtype=np.float32)
 
 
-def preprocess_frame(frame, image_size=(256, 256)):
-    img = cv2.resize(frame, image_size, interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_meta=False):
+    if keep_aspect:
+        img_u8, meta = resize_letterbox(frame, image_size)
+    else:
+        img_u8 = cv2.resize(frame, image_size, interpolation=cv2.INTER_AREA)
+        meta = {
+            'scale_x': image_size[0] / max(1.0, float(frame.shape[1])),
+            'scale_y': image_size[1] / max(1.0, float(frame.shape[0])),
+            'pad_x': 0.0,
+            'pad_y': 0.0,
+            'out_w': int(image_size[0]),
+            'out_h': int(image_size[1]),
+        }
+    img = img_u8.astype(np.float32) / 255.0
     img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    return torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
+    tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
+    if return_meta:
+        return tensor, meta
+    return tensor
 
 
 def draw_prediction(frame, pts, conf, heatmap_size=(64, 64), color=(0, 255, 255)):
@@ -267,6 +336,7 @@ def train(args):
         roi=args.roi,
         roi_pad=args.roi_pad,
         roi_jitter=args.roi_jitter,
+        keep_aspect=not args.stretch_roi,
         train=True,
         aug=args.augment,
     )
@@ -278,6 +348,7 @@ def train(args):
         roi=args.roi,
         roi_pad=args.roi_pad,
         roi_jitter=args.roi_jitter,
+        keep_aspect=not args.stretch_roi,
         train=False,
         aug=False,
     )
@@ -417,6 +488,7 @@ def main():
     p.add_argument('--roi', action='store_true')
     p.add_argument('--roi-pad', type=float, default=0.14)
     p.add_argument('--roi-jitter', type=float, default=0.06)
+    p.add_argument('--stretch-roi', action='store_true')
     p.add_argument('--augment', action='store_true')
     p.add_argument('--init-ckpt')
     p.add_argument('--no-pretrained', action='store_true')
