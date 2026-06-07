@@ -8,3 +8,5 @@ TASK_PROCESS.md
 datasets_pre
 runs_pre
 assets
+/*.md
+/*.csv
