@@ -53,7 +53,7 @@ def resize_to_height(img, h):
     return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def visualize_dataset(root, out_dir, count):
+def visualize_dataset(root, out_dir, count, draw_title=False):
     root = Path(root)
     out_dir = Path(out_dir)
     overlay_dir = out_dir / 'overlays'
@@ -73,7 +73,8 @@ def visualize_dataset(root, out_dir, count):
             continue
         h, w = img.shape[:2]
         stem = lp.stem
-        overlay = draw_corners(img, rec['corners_2d'], title=f'{root.name}/{stem}')
+        title = f'{root.name}/{stem}' if draw_title else None
+        overlay = draw_corners(img, rec['corners_2d'], title=title)
         heatmaps = make_heatmap_panel(rec['corners_2d'], w, h)
         ov_path = overlay_dir / f'{stem}_corners.png'
         hm_path = heatmap_dir / f'{stem}_heatmaps.png'
@@ -96,8 +97,9 @@ def main():
     ap.add_argument('--root', required=True)
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--count', type=int, default=24)
+    ap.add_argument('--title', action='store_true', help='Draw dataset/image title on overlays.')
     args = ap.parse_args()
-    visualize_dataset(args.root, args.out_dir, args.count)
+    visualize_dataset(args.root, args.out_dir, args.count, draw_title=args.title)
 
 
 if __name__ == '__main__':

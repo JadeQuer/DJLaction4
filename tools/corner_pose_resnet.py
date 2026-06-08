@@ -11,16 +11,24 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models
 
 
-def bbox_from_points(points, w, h, pad_ratio=0.35, jitter=0.0):
+def bbox_from_points(points, w, h, pad_ratio=0.35, jitter=0.0, square=False):
     pts = np.asarray(points, dtype=np.float32)
     x1, y1 = pts[:, 0].min(), pts[:, 1].min()
     x2, y2 = pts[:, 0].max(), pts[:, 1].max()
     bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
-    pad = max(bw, bh) * pad_ratio
-    x1 = x1 - pad
-    y1 = y1 - pad
-    x2 = x2 + pad
-    y2 = y2 + pad
+    if square:
+        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        side = max(bw, bh) * (1.0 + 2.0 * pad_ratio)
+        x1 = cx - side * 0.5
+        x2 = cx + side * 0.5
+        y1 = cy - side * 0.5
+        y2 = cy + side * 0.5
+    else:
+        pad = max(bw, bh) * pad_ratio
+        x1 = x1 - pad
+        y1 = y1 - pad
+        x2 = x2 + pad
+        y2 = y2 + pad
     if jitter > 0:
         jx = max(bw, bh) * jitter
         jy = max(bw, bh) * jitter
@@ -127,6 +135,39 @@ def apply_image_augment(img):
     return out
 
 
+def apply_geometry_augment(img, corners):
+    out = img.copy()
+    pts = np.asarray(corners, dtype=np.float32)[:, :2]
+    x1, y1 = pts.min(axis=0)
+    x2, y2 = pts.max(axis=0)
+    fill = tuple(int(v) for v in out.reshape(-1, 3).mean(axis=0))
+    if np.random.rand() < 0.45:
+        rw = (x2 - x1) * np.random.uniform(0.22, 0.46)
+        rh = (y2 - y1) * np.random.uniform(0.18, 0.42)
+        cx = np.random.uniform(x1 + rw * 0.5, x2 - rw * 0.5)
+        cy = np.random.uniform(y1 + rh * 0.5, y2 - rh * 0.5)
+        ax1 = int(np.clip(round(cx - rw * 0.5), 0, out.shape[1] - 1))
+        ax2 = int(np.clip(round(cx + rw * 0.5), 0, out.shape[1] - 1))
+        ay1 = int(np.clip(round(cy - rh * 0.5), 0, out.shape[0] - 1))
+        ay2 = int(np.clip(round(cy + rh * 0.5), 0, out.shape[0] - 1))
+        if ax2 > ax1 and ay2 > ay1:
+            patch = out[ay1:ay2, ax1:ax2]
+            if patch.size:
+                blurred = cv2.GaussianBlur(patch, (9, 9), 0)
+                mix = np.full_like(patch, fill)
+                out[ay1:ay2, ax1:ax2] = cv2.addWeighted(blurred, 0.35, mix, 0.65, 0)
+    if np.random.rand() < 0.30:
+        mask = np.zeros(out.shape[:2], dtype=np.uint8)
+        hull = cv2.convexHull(np.round(pts).astype(np.int32))
+        cv2.fillConvexPoly(mask, hull, 255)
+        bg = out.copy()
+        if np.random.rand() < 0.5:
+            bg = cv2.GaussianBlur(bg, (9, 9), 0)
+        bg = cv2.convertScaleAbs(bg, alpha=np.random.uniform(0.75, 1.15), beta=np.random.uniform(-20, 20))
+        out[mask == 0] = bg[mask == 0]
+    return out
+
+
 class CornerDataset(Dataset):
     def __init__(
         self,
@@ -137,9 +178,11 @@ class CornerDataset(Dataset):
         roi=False,
         roi_pad=0.60,
         roi_jitter=0.10,
+        square_roi=False,
         keep_aspect=True,
         train=True,
         aug=True,
+        geometry_aug=False,
     ):
         self.root = Path(root)
         self.labels = sorted((self.root / 'labels').glob('*.json'))
@@ -149,9 +192,11 @@ class CornerDataset(Dataset):
         self.roi = roi
         self.roi_pad = roi_pad
         self.roi_jitter = roi_jitter
+        self.square_roi = square_roi
         self.keep_aspect = keep_aspect
         self.train = train
         self.aug = aug
+        self.geometry_aug = geometry_aug
         if not self.labels:
             raise RuntimeError(f'No labels found under {self.root / "labels"}')
 
@@ -181,6 +226,7 @@ class CornerDataset(Dataset):
                 src_h,
                 pad_ratio=self.roi_pad,
                 jitter=self.roi_jitter if self.train else 0.0,
+                square=self.square_roi,
             )
             img, bbox, resize_meta = crop_and_resize(img, bbox, (self.image_w, self.image_h), keep_aspect=self.keep_aspect)
             x1, y1, x2, y2 = bbox
@@ -203,6 +249,8 @@ class CornerDataset(Dataset):
             label_w, label_h = src_w, src_h
         if self.aug and self.train:
             img = apply_image_augment(img)
+        if self.geometry_aug and self.train:
+            img = apply_geometry_augment(img, corners)
         img = img.astype(np.float32) / 255.0
         img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
         img = img.transpose(2, 0, 1)
@@ -336,9 +384,11 @@ def train(args):
         roi=args.roi,
         roi_pad=args.roi_pad,
         roi_jitter=args.roi_jitter,
+        square_roi=args.square_roi,
         keep_aspect=not args.stretch_roi,
         train=True,
         aug=args.augment,
+        geometry_aug=args.geometry_augment,
     )
     val_base = CornerDataset(
         args.data,
@@ -348,9 +398,11 @@ def train(args):
         roi=args.roi,
         roi_pad=args.roi_pad,
         roi_jitter=args.roi_jitter,
+        square_roi=args.square_roi,
         keep_aspect=not args.stretch_roi,
         train=False,
         aug=False,
+        geometry_aug=False,
     )
     total = len(train_base)
     n_val = max(1, int(total * 0.15))
@@ -488,8 +540,10 @@ def main():
     p.add_argument('--roi', action='store_true')
     p.add_argument('--roi-pad', type=float, default=0.14)
     p.add_argument('--roi-jitter', type=float, default=0.06)
+    p.add_argument('--square-roi', action='store_true')
     p.add_argument('--stretch-roi', action='store_true')
     p.add_argument('--augment', action='store_true')
+    p.add_argument('--geometry-augment', action='store_true')
     p.add_argument('--init-ckpt')
     p.add_argument('--no-pretrained', action='store_true')
     p.add_argument('--cpu', action='store_true')

@@ -1,7 +1,9 @@
 import argparse
+import csv
 import json
 import math
 import random
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import bpy
@@ -394,6 +396,7 @@ def make_random_background(bg_dir, width, height):
     import cv2
 
     bg_paths = sorted(Path(bg_dir).glob("*.png")) + sorted(Path(bg_dir).glob("*.jpg"))
+    bg_paths = [p for p in bg_paths if "contact_sheet" not in p.stem]
     if not bg_paths:
         raise RuntimeError(f"No background images found in {bg_dir}")
     bg = cv2.imread(str(random.choice(bg_paths)), cv2.IMREAD_COLOR)
@@ -427,10 +430,27 @@ def composite_on_background(image_path, bg_dir):
     cv2.imwrite(str(image_path), comp)
 
 
+def composite_cropped_foreground_on_background(image_path, bg_dir):
+    import cv2
+
+    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"Failed to read cropped foreground: {image_path}")
+    if img.ndim != 3 or img.shape[2] < 4:
+        return None
+    h, w = img.shape[:2]
+    fg = img[:, :, :3].astype(np.float32)
+    alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+    bg = make_random_background(bg_dir, w, h).astype(np.float32)
+    comp = np.clip(fg * alpha + bg * (1.0 - alpha), 0, 255).astype(np.uint8)
+    cv2.imwrite(str(image_path), comp)
+    return True
+
+
 def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size, post_effects=False, pad_px=None, final_pad_px=None, square_crop=True):
     import cv2
 
-    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError(f"Failed to read rendered image: {image_path}")
     pts = np.asarray([[p[0], p[1]] for p in corners_2d], dtype=np.float32)
@@ -491,14 +511,17 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
     sx = out_size / max(1.0, float(crop_w))
     sy = out_size / max(1.0, float(crop_h))
     if post_effects:
+        alpha = crop[:, :, 3:4] if crop.ndim == 3 and crop.shape[2] == 4 else None
+        color = crop[:, :, :3] if alpha is not None else crop
         if random.random() < 0.35:
-            crop = cv2.GaussianBlur(crop, (3, 3), random.uniform(0.20, 0.45))
-        crop_f = crop.astype(np.float32)
+            color = cv2.GaussianBlur(color, (3, 3), random.uniform(0.20, 0.45))
+        crop_f = color.astype(np.float32)
         crop_f = np.clip(crop_f * random.uniform(1.06, 1.18) + random.uniform(2.0, 8.0), 0, 255)
         if random.random() < 0.35:
             noise = np.random.normal(0.0, random.uniform(0.8, 2.0), crop_f.shape).astype(np.float32)
             crop_f = np.clip(crop_f + noise, 0, 255)
-        crop = crop_f.astype(np.uint8)
+        color = crop_f.astype(np.uint8)
+        crop = np.concatenate([color, alpha], axis=2) if alpha is not None else color
     cv2.imwrite(str(out_path), crop)
     transformed = []
     for x, y, z in corners_2d:
@@ -567,6 +590,252 @@ def balanced_camera_direction(sample_index, jitter=0.22):
     return v.normalized()
 
 
+def real_video_like_camera_direction(sample_index, jitter=0.12):
+    """Bias previews/training toward the horizontal Action 4 poses seen in the target video."""
+    base_dirs = [
+        (0.35, -1.00, 0.12), (-0.35, -1.00, 0.12),
+        (0.55, -0.85, 0.20), (-0.55, -0.85, 0.20),
+        (0.85, -0.55, 0.16), (-0.85, -0.55, 0.16),
+        (0.25, -1.00, -0.18), (-0.25, -1.00, -0.18),
+        (0.65, -0.75, -0.18), (-0.65, -0.75, -0.18),
+        (0.15, -0.95, 0.45), (-0.15, -0.95, 0.45),
+        (0.95, -0.25, 0.12), (-0.95, -0.25, 0.12),
+        (0.55, -0.65, 0.52), (-0.55, -0.65, 0.52),
+        (0.45, -0.65, -0.45), (-0.45, -0.65, -0.45),
+        (0.00, -1.00, 0.00), (0.00, -1.00, 0.28),
+    ]
+    v = mathutils.Vector(base_dirs[sample_index % len(base_dirs)])
+    v += mathutils.Vector((
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter * 0.8, jitter * 0.8),
+    ))
+    if v.length < 1e-6:
+        v = mathutils.Vector((0.0, -1.0, 0.0))
+    return v.normalized()
+
+
+def real_csv_face_camera_direction(sample_index, jitter=0.28):
+    """Sample major visible faces according to the remapped real CSV labels."""
+    face_to_dir = {
+        "x_min": (-1.0, 0.0, 0.0),  # 0-1-3-2
+        "x_max": (1.0, 0.0, 0.0),   # 4-5-7-6
+        "y_max": (0.0, 1.0, 0.0),   # 2-3-7-6
+        "z_min": (0.0, 0.0, -1.0),  # 0-2-6-4
+        "z_max": (0.0, 0.0, 1.0),   # 1-3-7-5
+        "y_min": (0.0, -1.0, 0.0),  # 0-1-5-4
+    }
+    base = mathutils.Vector(face_to_dir[real_csv_target_face(sample_index)])
+
+    side_dirs = [
+        mathutils.Vector((1.0, 0.0, 0.0)),
+        mathutils.Vector((-1.0, 0.0, 0.0)),
+        mathutils.Vector((0.0, 1.0, 0.0)),
+        mathutils.Vector((0.0, -1.0, 0.0)),
+        mathutils.Vector((0.0, 0.0, 1.0)),
+        mathutils.Vector((0.0, 0.0, -1.0)),
+    ]
+    side_dirs = [v for v in side_dirs if abs(v.dot(base)) < 0.5]
+    side = side_dirs[sample_index % len(side_dirs)]
+    v = base * random.uniform(0.78, 1.0) + side * random.uniform(0.18, 0.45)
+    v += mathutils.Vector((
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+    ))
+    if v.length < 1e-6:
+        v = base
+    return v.normalized()
+
+
+def direct_side_face_camera_direction(sample_index, jitter=0.035):
+    """Camera directions that look almost straight at the two side faces."""
+    base_dirs = [
+        mathutils.Vector((1.0, 0.0, 0.0)),   # x_max: 4-5-7-6
+        mathutils.Vector((-1.0, 0.0, 0.0)),  # x_min: 0-1-3-2
+    ]
+    base = base_dirs[sample_index % len(base_dirs)]
+    # Keep only mild off-axis variation so the side face remains dominant.
+    v = base + mathutils.Vector((
+        0.0,
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+    ))
+    return v.normalized()
+
+
+def tilted_side_face_camera_direction(sample_index, jitter=0.16):
+    """Side-dominant views with enough tilt to reveal adjacent faces."""
+    base_dirs = [
+        mathutils.Vector((1.0, 0.26, 0.16)),
+        mathutils.Vector((1.0, -0.24, -0.14)),
+        mathutils.Vector((-1.0, 0.26, -0.16)),
+        mathutils.Vector((-1.0, -0.24, 0.14)),
+        mathutils.Vector((1.0, 0.38, -0.08)),
+        mathutils.Vector((-1.0, -0.38, 0.08)),
+    ]
+    base = base_dirs[sample_index % len(base_dirs)]
+    v = base + mathutils.Vector((
+        random.uniform(-jitter * 0.35, jitter * 0.35),
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+    ))
+    return v.normalized()
+
+
+def tilted_screen_front_camera_direction(sample_index, jitter=0.14):
+    """Large-screen-front views with slight yaw/pitch variation."""
+    base_dirs = [
+        mathutils.Vector((0.16, 0.18, -1.0)),
+        mathutils.Vector((-0.16, 0.16, -1.0)),
+        mathutils.Vector((0.25, -0.08, -1.0)),
+        mathutils.Vector((-0.25, -0.06, -1.0)),
+        mathutils.Vector((0.08, 0.30, -1.0)),
+        mathutils.Vector((-0.08, -0.24, -1.0)),
+    ]
+    base = base_dirs[sample_index % len(base_dirs)]
+    v = base + mathutils.Vector((
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter * 0.35, jitter * 0.35),
+    ))
+    return v.normalized()
+
+
+def front_then_side_camera_direction(sample_index, jitter=0.16):
+    """A deterministic preview/training mix: a few screen-front views, then side-dominant views."""
+    cycle = sample_index % 16
+    if cycle < 3:
+        return tilted_screen_front_camera_direction(cycle, jitter=jitter * 0.75)
+    side_dirs = [
+        mathutils.Vector((1.0, 0.26, 0.16)),
+        mathutils.Vector((-1.0, 0.26, -0.16)),
+        mathutils.Vector((1.0, -0.30, -0.12)),
+        mathutils.Vector((-1.0, -0.30, 0.12)),
+        mathutils.Vector((0.20, 1.0, 0.18)),
+        mathutils.Vector((-0.22, 1.0, -0.16)),
+        mathutils.Vector((0.34, 0.18, 1.0)),
+        mathutils.Vector((-0.34, -0.18, 1.0)),
+        mathutils.Vector((0.30, 0.18, -1.0)),
+        mathutils.Vector((-0.30, -0.18, -1.0)),
+        mathutils.Vector((1.0, 0.42, -0.26)),
+        mathutils.Vector((-1.0, 0.42, 0.26)),
+        mathutils.Vector((1.0, -0.46, 0.24)),
+    ]
+    base = side_dirs[(cycle - 3) % len(side_dirs)]
+    v = base + mathutils.Vector((
+        random.uniform(-jitter * 0.45, jitter * 0.45),
+        random.uniform(-jitter, jitter),
+        random.uniform(-jitter, jitter),
+    ))
+    return v.normalized()
+
+
+def polygon_area_2d(points):
+    pts = np.asarray(points, dtype=np.float32)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def face_weights_from_corners(corners_2d):
+    pts = np.asarray([[p[0], p[1]] for p in corners_2d], dtype=np.float32)
+    faces = {
+        "x_min": [0, 1, 3, 2],
+        "x_max": [4, 5, 7, 6],
+        "y_min": [0, 1, 5, 4],
+        "y_max": [2, 3, 7, 6],
+        "z_min": [0, 2, 6, 4],
+        "z_max": [1, 3, 7, 5],
+    }
+    areas = {name: polygon_area_2d(pts[idxs]) for name, idxs in faces.items()}
+    total = sum(areas.values()) + 1e-6
+    weights = {name: area / total for name, area in areas.items()}
+    ranked = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
+    return weights, ranked
+
+
+def real_csv_target_face(sample_index):
+    # Interleave faces so small previews do not collapse to a single face.
+    sequence = [
+        "x_max", "x_min", "y_max", "x_max",
+        "x_min", "z_max", "y_max", "x_max",
+        "x_min", "z_min", "y_max", "x_max",
+        "x_min", "z_max", "y_max", "y_min",
+    ]
+    return sequence[sample_index % len(sequence)]
+
+
+def corner_shape_descriptor(corners_2d, width, height):
+    pts = np.asarray([[p[0] / float(width), p[1] / float(height)] for p in corners_2d], dtype=np.float32)
+    x1, y1 = pts.min(axis=0)
+    x2, y2 = pts.max(axis=0)
+    bw = max(1e-6, float(x2 - x1))
+    bh = max(1e-6, float(y2 - y1))
+    norm = pts.copy()
+    norm[:, 0] = (norm[:, 0] - x1) / bw
+    norm[:, 1] = (norm[:, 1] - y1) / bh
+    edges = [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+    edge_lengths = [float(np.linalg.norm(norm[a] - norm[b])) for a, b in edges]
+    face_weights, ranked = face_weights_from_corners([[p[0] * width, p[1] * height, 1.0] for p in pts])
+    face_vec = [face_weights[k] for k in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")]
+    parts = [
+        (pts - 0.5).reshape(-1) * 0.65,
+        (norm - 0.5).reshape(-1) * 1.0,
+        np.asarray([bw, bh, bw / bh], dtype=np.float32) * 0.7,
+        np.asarray(edge_lengths, dtype=np.float32) * 0.35,
+        np.asarray(face_vec, dtype=np.float32) * 0.55,
+    ]
+    return np.concatenate(parts).astype(np.float32)
+
+
+def load_real_corner_shape_bank(csv_paths):
+    by_img = defaultdict(list)
+    for path in csv_paths:
+        if not path or not Path(path).exists():
+            continue
+        with Path(path).open(newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if len(row) < 6:
+                    continue
+                try:
+                    label = int(row[0])
+                    x = float(row[1])
+                    y = float(row[2])
+                    w = float(row[4])
+                    h = float(row[5])
+                except ValueError:
+                    continue
+                by_img[row[3]].append((label, x, y, w, h))
+    bank = []
+    for img_name, rows in by_img.items():
+        counts = Counter(r[0] for r in rows)
+        if len(rows) != 8 or any(counts[i] != 1 for i in range(8)):
+            continue
+        ordered = sorted(rows, key=lambda r: r[0])
+        w = ordered[0][3]
+        h = ordered[0][4]
+        corners = [[x, y, 1.0] for _label, x, y, _w, _h in ordered]
+        bank.append({"image": img_name, "descriptor": corner_shape_descriptor(corners, w, h)})
+    return bank
+
+
+def nearest_real_corner_shape(corners_2d, width, height, shape_bank):
+    if not shape_bank:
+        return None, 0.0
+    desc = corner_shape_descriptor(corners_2d, width, height)
+    dists = [(float(np.linalg.norm(desc - item["descriptor"])), item) for item in shape_bank]
+    dists.sort(key=lambda x: x[0])
+    return dists[0][1], dists[0][0]
+
+
+def corner_shape_distance(corners_2d, width, height, shape_item):
+    if shape_item is None:
+        return None
+    desc = corner_shape_descriptor(corners_2d, width, height)
+    return float(np.linalg.norm(desc - shape_item["descriptor"]))
+
+
 def make_mesh_materials_visible(obj, min_base=0.16):
     # Blender's material preview uses a bright studio HDRI. In scripted renders,
     # pure-black imported PBR bases need a neutral floor to show plastic detail.
@@ -595,8 +864,39 @@ def set_input_if_present(bsdf, names, value):
     return False
 
 
+def darken_base_color_input(mat, bsdf, scale):
+    if "Base Color" not in bsdf.inputs:
+        return
+    base_input = bsdf.inputs["Base Color"]
+    col = base_input.default_value
+    base_input.default_value = (
+        max(0.004, col[0] * scale),
+        max(0.004, col[1] * scale),
+        max(0.0035, col[2] * scale),
+        col[3],
+    )
+    if not base_input.links:
+        return
+
+    tree = mat.node_tree
+    original_link = base_input.links[0]
+    source_socket = original_link.from_socket
+    try:
+        tree.links.remove(original_link)
+    except RuntimeError:
+        return
+
+    mix = tree.nodes.new(type="ShaderNodeMixRGB")
+    mix.name = "BodyTextureDarken"
+    mix.blend_type = "MULTIPLY"
+    mix.inputs[0].default_value = 1.0
+    mix.inputs[2].default_value = (scale, scale, scale, 1.0)
+    tree.links.new(source_socket, mix.inputs[1])
+    tree.links.new(mix.outputs[0], base_input)
+
+
 def enhance_natural_reflections(obj, body_roughness=0.42, glass_roughness=0.16, body_specular=0.58, glass_specular=0.88, body_color_scale=0.45):
-    glass_keys = ("boli", "glass", "pbr", "siyin", "screen", "lens")
+    glass_keys = ("boli", "glass", "siyin", "screen", "lens")
     for mat in obj.data.materials:
         if not mat or not mat.use_nodes:
             continue
@@ -607,14 +907,8 @@ def enhance_natural_reflections(obj, body_roughness=0.42, glass_roughness=0.16, 
         is_glass = any(k in name for k in glass_keys)
         rough = glass_roughness if is_glass else body_roughness
         spec = glass_specular if is_glass else body_specular
-        if not is_glass and "Base Color" in bsdf.inputs:
-            col = bsdf.inputs["Base Color"].default_value
-            bsdf.inputs["Base Color"].default_value = (
-                max(0.010, col[0] * body_color_scale),
-                max(0.010, col[1] * body_color_scale),
-                max(0.009, col[2] * body_color_scale),
-                col[3],
-            )
+        if not is_glass:
+            darken_base_color_input(mat, bsdf, body_color_scale)
         if "Roughness" in bsdf.inputs:
             bsdf.inputs["Roughness"].default_value = min(bsdf.inputs["Roughness"].default_value, rough)
         set_input_if_present(bsdf, ("Specular IOR Level", "Specular"), spec)
@@ -698,15 +992,35 @@ def main():
     parser.add_argument("--background-plane", action="store_true")
     parser.add_argument("--background-dir", default=Path("assets/real_video_backgrounds_head_left_inpaint"), type=Path)
     parser.add_argument("--samples", default=24, type=int)
-    parser.add_argument("--body-roughness", default=0.54, type=float)
-    parser.add_argument("--body-color-scale", default=0.035, type=float)
-    parser.add_argument("--glass-roughness", default=0.08, type=float)
+    parser.add_argument("--body-roughness", default=0.50, type=float)
+    parser.add_argument("--body-color-scale", default=0.0001, type=float)
+    parser.add_argument("--glass-roughness", default=0.045, type=float)
     parser.add_argument("--glass-specular", default=1.0, type=float)
-    parser.add_argument("--reflection-scale", default=0.24, type=float)
+    parser.add_argument("--reflection-scale", default=0.42, type=float)
     parser.add_argument("--orbit-camera", action="store_true", default=True)
     parser.add_argument("--front-camera", dest="orbit_camera", action="store_false")
-    parser.add_argument("--view-mode", default="balanced_faces", choices=["random_orbit", "balanced_faces"])
+    parser.add_argument("--view-mode", default="real_corner_shapes", choices=["random_orbit", "balanced_faces", "real_video_like", "real_csv_faces", "real_corner_shapes", "direct_side_faces", "tilted_side_faces", "tilted_screen_front", "front_then_sides"])
     parser.add_argument("--view-jitter", default=0.16, type=float)
+    parser.add_argument("--real-like-filter", action="store_true", default=True)
+    parser.add_argument("--no-real-like-filter", dest="real_like_filter", action="store_false")
+    parser.add_argument("--real-like-aspect-min", default=1.08, type=float)
+    parser.add_argument("--real-like-aspect-max", default=1.65, type=float)
+    parser.add_argument("--real-like-hfrac-min", default=0.52, type=float)
+    parser.add_argument("--real-like-hfrac-max", default=0.82, type=float)
+    parser.add_argument("--multi-face-filter", action="store_true", default=True)
+    parser.add_argument("--no-multi-face-filter", dest="multi_face_filter", action="store_false")
+    parser.add_argument("--top-face-weight-max", default=0.52, type=float)
+    parser.add_argument("--second-face-weight-min", default=0.12, type=float)
+    parser.add_argument("--real-corner-csv", nargs="*", default=[
+        "labels_my-project-name_2026-05-25-02-16-54.csv",
+        "labels_my-project-name_2026-05-25-03-59-55.csv",
+        "labels_my-project-name_2026-05-25-11-21-48.csv",
+    ])
+    parser.add_argument("--corner-shape-filter", action="store_true", default=True)
+    parser.add_argument("--no-corner-shape-filter", dest="corner_shape_filter", action="store_false")
+    parser.add_argument("--corner-shape-max-dist", default=0.90, type=float)
+    parser.add_argument("--corner-shape-target-mode", default="nearest", choices=["cycle", "nearest"])
+    parser.add_argument("--corner-shape-max-per-real", default=0, type=int)
     parser.add_argument("--camera-radius-min", default=270.0, type=float)
     parser.add_argument("--camera-radius-max", default=370.0, type=float)
     parser.add_argument("--camera-height-min", default=-190.0, type=float)
@@ -716,6 +1030,9 @@ def main():
     parser.add_argument("--cx", default=325.2611083984375, type=float)
     parser.add_argument("--cy", default=242.04899588216654, type=float)
     args = parser.parse_args()
+    real_shape_bank = load_real_corner_shape_bank([Path(p) for p in args.real_corner_csv]) if args.corner_shape_filter else []
+    if args.view_mode == "real_corner_shapes":
+        print(f"loaded real corner shape bank: {len(real_shape_bank)} samples")
 
     clear_scene()
     scene = bpy.context.scene
@@ -794,6 +1111,7 @@ def main():
     target_idx = idx + args.num_images
     attempts = 0
     max_attempts = args.num_images * 80
+    corner_shape_match_counts = Counter()
     while idx < target_idx and attempts < max_attempts:
         attempts += 1
         obj.rotation_euler = (random.uniform(-0.45, 0.45), random.uniform(-2.75, 2.75), random.uniform(-0.55, 0.55))
@@ -803,9 +1121,38 @@ def main():
             random.uniform(-10, 10),
         )
 
-        sample_no = idx - int(args.start_index)
+        sample_no = attempts - 1
+        target_shape = None
+        if args.view_mode == "real_corner_shapes" and real_shape_bank and args.corner_shape_target_mode == "cycle":
+            target_shape = real_shape_bank[sample_no % len(real_shape_bank)]
         if args.orbit_camera and args.view_mode == "balanced_faces":
             direction = balanced_camera_direction(sample_no, jitter=args.view_jitter)
+            radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
+            cam.location = obj.location + direction * radius
+        elif args.orbit_camera and args.view_mode == "real_video_like":
+            direction = real_video_like_camera_direction(sample_no, jitter=args.view_jitter)
+            radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
+            cam.location = obj.location + direction * radius
+        elif args.orbit_camera and args.view_mode in {"direct_side_faces", "tilted_side_faces", "tilted_screen_front", "front_then_sides"}:
+            if args.view_mode == "direct_side_faces":
+                direction = direct_side_face_camera_direction(sample_no, jitter=args.view_jitter)
+            elif args.view_mode == "tilted_side_faces":
+                direction = tilted_side_face_camera_direction(sample_no, jitter=args.view_jitter)
+            elif args.view_mode == "tilted_screen_front":
+                direction = tilted_screen_front_camera_direction(sample_no, jitter=args.view_jitter)
+            else:
+                direction = front_then_side_camera_direction(sample_no, jitter=args.view_jitter)
+            direction = (obj.matrix_world.to_3x3() @ direction).normalized()
+            radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
+            cam.location = obj.location + direction * radius
+        elif args.orbit_camera and args.view_mode == "real_csv_faces":
+            direction = real_csv_face_camera_direction(sample_no, jitter=args.view_jitter)
+            direction = (obj.matrix_world.to_3x3() @ direction).normalized()
+            radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
+            cam.location = obj.location + direction * radius
+        elif args.orbit_camera and args.view_mode == "real_corner_shapes":
+            direction = real_csv_face_camera_direction(sample_no, jitter=args.view_jitter)
+            direction = (obj.matrix_world.to_3x3() @ direction).normalized()
             radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
             cam.location = obj.location + direction * radius
         elif args.orbit_camera:
@@ -863,9 +1210,6 @@ def main():
         cam_fy = args.fy
         cam_cx = args.cx
         cam_cy = args.cy
-        if args.background_dir:
-            composite_on_background(raw_path if args.crop_output else final_path, args.background_dir)
-
         if args.crop_output:
             label_corners, crop_info = crop_render_and_points(
                 raw_path,
@@ -879,6 +1223,46 @@ def main():
                 square_crop=not args.rect_crop_output,
             )
             raw_path.unlink(missing_ok=True)
+            if args.view_mode in {"real_video_like", "real_csv_faces", "real_corner_shapes"} and args.real_like_filter:
+                crop_pts = np.asarray([[p[0], p[1]] for p in label_corners], dtype=np.float32)
+                cx1, cy1 = crop_pts.min(axis=0)
+                cx2, cy2 = crop_pts.max(axis=0)
+                bw = max(1.0, float(cx2 - cx1))
+                bh = max(1.0, float(cy2 - cy1))
+                aspect = bw / bh
+                h_frac = bh / float(args.crop_size)
+                if (
+                    aspect < args.real_like_aspect_min
+                    or aspect > args.real_like_aspect_max
+                    or h_frac < args.real_like_hfrac_min
+                    or h_frac > args.real_like_hfrac_max
+                ):
+                    final_path.unlink(missing_ok=True)
+                    continue
+            if args.view_mode == "real_csv_faces" and args.multi_face_filter:
+                face_weights, ranked_faces = face_weights_from_corners(label_corners)
+                target_face = real_csv_target_face(sample_no)
+                if (
+                    ranked_faces[0][0] != target_face
+                    or ranked_faces[0][1] > args.top_face_weight_max
+                    or ranked_faces[1][1] < args.second_face_weight_min
+                ):
+                    final_path.unlink(missing_ok=True)
+                    continue
+            nearest_shape = None
+            nearest_shape_dist = None
+            if args.view_mode == "real_corner_shapes" and args.corner_shape_filter:
+                if target_shape is not None:
+                    nearest_shape = target_shape
+                    nearest_shape_dist = corner_shape_distance(label_corners, args.crop_size, args.crop_size, target_shape)
+                else:
+                    nearest_shape, nearest_shape_dist = nearest_real_corner_shape(label_corners, args.crop_size, args.crop_size, real_shape_bank)
+                if nearest_shape is None or nearest_shape_dist is None or nearest_shape_dist > args.corner_shape_max_dist:
+                    final_path.unlink(missing_ok=True)
+                    continue
+                if args.corner_shape_max_per_real > 0 and corner_shape_match_counts[nearest_shape["image"]] >= args.corner_shape_max_per_real:
+                    final_path.unlink(missing_ok=True)
+                    continue
             x1, y1, _x2, _y2 = crop_info["xyxy"]
             cam_width = args.crop_size
             cam_height = args.crop_size
@@ -886,6 +1270,10 @@ def main():
             cam_fy = args.fy * crop_info["scale_y"]
             cam_cx = (args.cx - x1) * crop_info["scale_x"] + crop_info.get("pad_x", 0.0)
             cam_cy = (args.cy - y1) * crop_info["scale_y"] + crop_info.get("pad_y", 0.0)
+            if args.background_dir:
+                composite_cropped_foreground_on_background(final_path, args.background_dir)
+        elif args.background_dir:
+            composite_on_background(final_path, args.background_dir)
 
         record = {
             "image": f"rgb/{stem}.png",
@@ -908,6 +1296,16 @@ def main():
             "object_location": [float(v) for v in obj.location],
             "object_rotation_euler": [float(v) for v in obj.rotation_euler],
         }
+        if args.view_mode == "real_corner_shapes":
+            if nearest_shape is not None:
+                corner_shape_match_counts[nearest_shape["image"]] += 1
+            record["corner_shape_match"] = {
+                "target_mode": args.corner_shape_target_mode,
+                "target_real_image": None if target_shape is None else target_shape["image"],
+                "matched_real_image": None if nearest_shape is None else nearest_shape["image"],
+                "distance": nearest_shape_dist,
+                "max_distance": args.corner_shape_max_dist,
+            }
         (label_dir / f"{stem}.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
         all_records.append(record)
         idx += 1

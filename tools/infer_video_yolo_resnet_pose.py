@@ -15,7 +15,7 @@ def train(*_args, **_kwargs):
     pass
 
 
-def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad, roi_shrink):
+def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad, roi_shrink, square_roi=True):
     results = detector.predict(frame, conf=conf, iou=iou, max_det=max_rois, verbose=False)
     if not results:
         return []
@@ -35,11 +35,36 @@ def yolo_rois(detector, frame, conf, iou, max_rois, roi_pad, roi_shrink):
             x1, x2 = cx - bw0 * 0.5, cx + bw0 * 0.5
             y1, y2 = cy - bh0 * 0.5, cy + bh0 * 0.5
         bw, bh = x2 - x1, y2 - y1
-        pad = roi_pad * max(bw, bh)
-        x1 = int(max(0, np.floor(x1 - pad)))
-        y1 = int(max(0, np.floor(y1 - pad)))
-        x2 = int(min(w - 1, np.ceil(x2 + pad)))
-        y2 = int(min(h - 1, np.ceil(y2 + pad)))
+        if square_roi:
+            cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+            side = max(bw, bh) * (1.0 + 2.0 * roi_pad)
+            side = min(side, float(w - 1), float(h - 1))
+            x1 = cx - side * 0.5
+            x2 = cx + side * 0.5
+            y1 = cy - side * 0.5
+            y2 = cy + side * 0.5
+            if x1 < 0:
+                x2 -= x1
+                x1 = 0.0
+            if y1 < 0:
+                y2 -= y1
+                y1 = 0.0
+            if x2 > w - 1:
+                x1 -= x2 - (w - 1)
+                x2 = float(w - 1)
+            if y2 > h - 1:
+                y1 -= y2 - (h - 1)
+                y2 = float(h - 1)
+        else:
+            pad = roi_pad * max(bw, bh)
+            x1 = x1 - pad
+            y1 = y1 - pad
+            x2 = x2 + pad
+            y2 = y2 + pad
+        x1 = int(max(0, np.floor(x1)))
+        y1 = int(max(0, np.floor(y1)))
+        x2 = int(min(w - 1, np.ceil(x2)))
+        y2 = int(min(h - 1, np.ceil(y2)))
         if x2 <= x1 or y2 <= y1:
             continue
         rois.append((float(scores[idx]), x1, y1, x2, y2))
@@ -114,7 +139,7 @@ def infer(args):
                 frame_idx += 1
                 continue
             vis = frame.copy()
-            rois = yolo_rois(detector, frame, args.det_conf, args.det_iou, args.max_rois, args.roi_pad, args.roi_shrink)
+            rois = yolo_rois(detector, frame, args.det_conf, args.det_iou, args.max_rois, args.roi_pad, args.roi_shrink, square_roi=not args.rect_roi)
             per_frame = []
             for roi_id, (det_score, x1, y1, x2, y2) in enumerate(rois):
                 crop = frame[y1:y2 + 1, x1:x2 + 1]
@@ -185,6 +210,7 @@ def main():
     ap.add_argument('--det-iou', type=float, default=0.5)
     ap.add_argument('--roi-pad', type=float, default=0.08)
     ap.add_argument('--roi-shrink', type=float, default=0.0)
+    ap.add_argument('--rect-roi', action='store_true')
     ap.add_argument('--max-rois', type=int, default=2)
     ap.add_argument('--stride', type=int, default=3)
     ap.add_argument('--max-frames', type=int, default=300)
