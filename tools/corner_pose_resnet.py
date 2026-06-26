@@ -259,19 +259,43 @@ class CornerDataset(Dataset):
         return torch.from_numpy(img), torch.from_numpy(hms), torch.from_numpy(pts)
 
 
+def make_resnet_layer4_dilated(net):
+    """Keep ResNet layer4 at stride 16 instead of stride 32."""
+    block0 = net.layer4[0]
+    block0.conv1.stride = (1, 1)
+    if block0.downsample is not None:
+        block0.downsample[0].stride = (1, 1)
+    for block in net.layer4:
+        block.conv1.dilation = (2, 2)
+        block.conv1.padding = (2, 2)
+        block.conv2.dilation = (2, 2)
+        block.conv2.padding = (2, 2)
+
+
+def _make_group_norm(num_channels):
+    for num_groups in (32, 16, 8, 4, 2, 1):
+        if num_channels % num_groups == 0:
+            return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
+    return nn.GroupNorm(num_groups=1, num_channels=num_channels)
+
+
 class ResNetCornerNet(nn.Module):
-    def __init__(self, backbone='resnet18', pretrained=True, out_channels=8):
+    def __init__(self, backbone='resnet18', pretrained=True, out_channels=8, heatmap_size=64):
         super().__init__()
-        if backbone == 'resnet18':
+        if heatmap_size not in (64, 128):
+            raise ValueError(f'Unsupported heatmap_size: {heatmap_size}; expected 64 or 128')
+        if backbone in ('resnet18', 'resnet18_dilated'):
             weights = models.ResNet18_Weights.DEFAULT if pretrained else None
             net = models.resnet18(weights=weights)
             c3, c4, c5 = 128, 256, 512
-        elif backbone == 'resnet34':
+        elif backbone in ('resnet34', 'resnet34_dilated'):
             weights = models.ResNet34_Weights.DEFAULT if pretrained else None
             net = models.resnet34(weights=weights)
             c3, c4, c5 = 128, 256, 512
         else:
             raise ValueError(f'Unsupported backbone: {backbone}')
+        if backbone.endswith('_dilated'):
+            make_resnet_layer4_dilated(net)
         self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
         self.layer1 = net.layer1
         self.layer2 = net.layer2
@@ -281,19 +305,23 @@ class ResNetCornerNet(nn.Module):
         self.lat5 = nn.Conv2d(c5, 256, 1)
         self.lat4 = nn.Conv2d(c4, 256, 1)
         self.lat3 = nn.Conv2d(c3, 256, 1)
-        self.smooth4 = nn.Conv2d(256, 256, 3, padding=1)
-        self.smooth3 = nn.Conv2d(256, 256, 3, padding=1)
+        self.lat2 = nn.Conv2d(64, 256, 1)
+        self.output_wh = (heatmap_size, heatmap_size)
+        self.smooth4 = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1), _make_group_norm(256), nn.ReLU(inplace=True))
+        self.smooth3 = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1), _make_group_norm(256), nn.ReLU(inplace=True))
+        self.smooth2 = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1), _make_group_norm(256), nn.ReLU(inplace=True))
 
-        self.head = nn.Sequential(
+        head_layers = [
             nn.Conv2d(256, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
+            _make_group_norm(128),
             nn.ReLU(inplace=True),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(128, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            _make_group_norm(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, out_channels, 1),
-        )
+        ]
+        head_layers.append(nn.Conv2d(64, out_channels, 1))
+        self.head = nn.Sequential(*head_layers)
 
     def _upsample_add(self, x, y):
         return F.interpolate(x, size=y.shape[-2:], mode='bilinear', align_corners=False) + y
@@ -308,7 +336,11 @@ class ResNetCornerNet(nn.Module):
         p5 = self.lat5(c5)
         p4 = self.smooth4(self._upsample_add(p5, self.lat4(c4)))
         p3 = self.smooth3(self._upsample_add(p4, self.lat3(c3)))
-        return self.head(p3)
+        p2 = self.smooth2(self._upsample_add(p3, self.lat2(c2)))
+        heatmaps = self.head(p2)
+        if heatmaps.shape[-2:] != self.output_wh:
+            heatmaps = F.interpolate(heatmaps, size=self.output_wh, mode='bilinear', align_corners=False)
+        return heatmaps
 
 
 def decode_heatmaps(logits, topk=9):
@@ -413,7 +445,7 @@ def train(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    model = ResNetCornerNet(backbone=args.backbone, pretrained=not args.no_pretrained).to(device)
+    model = ResNetCornerNet(backbone=args.backbone, pretrained=not args.no_pretrained, heatmap_size=args.heatmap_size).to(device)
     if getattr(args, 'init_ckpt', None):
         ckpt = torch.load(args.init_ckpt, map_location=device)
         state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
@@ -469,7 +501,7 @@ def train(args):
 
 def infer_video(args):
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
-    model = ResNetCornerNet(backbone=args.backbone, pretrained=False).to(device)
+    model = ResNetCornerNet(backbone=args.backbone, pretrained=False, heatmap_size=args.heatmap_size).to(device)
     ckpt = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -533,7 +565,7 @@ def main():
     p.add_argument('--epochs', type=int, default=80)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34'])
+    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated'])
     p.add_argument('--image-size', type=int, default=256)
     p.add_argument('--heatmap-size', type=int, default=64)
     p.add_argument('--sigma', type=float, default=1.8)
@@ -556,7 +588,7 @@ def main():
     p.add_argument('--stride', type=int, default=3)
     p.add_argument('--max-frames', type=int, default=300)
     p.add_argument('--output-width', type=int, default=960)
-    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34'])
+    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated'])
     p.add_argument('--image-size', type=int, default=256)
     p.add_argument('--heatmap-size', type=int, default=64)
     p.add_argument('--cpu', action='store_true')

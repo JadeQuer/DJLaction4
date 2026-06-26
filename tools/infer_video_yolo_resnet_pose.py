@@ -114,7 +114,7 @@ def infer(args):
     if not Path(detector_path).exists():
         raise FileNotFoundError(f'Fixed DJI Action 4 detector not found: {detector_path}')
     detector = YOLO(detector_path)
-    model = ResNetCornerNet(backbone=args.backbone, pretrained=False).to(device)
+    model = ResNetCornerNet(backbone=args.backbone, pretrained=False, heatmap_size=args.heatmap_size).to(device)
     ckpt = torch.load(args.corner_ckpt, map_location=device)
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -225,7 +225,7 @@ def main():
     ap.add_argument('--stretch-roi', action='store_true')
     ap.add_argument('--debug-dir')
     ap.add_argument('--debug-frames', type=int, default=24)
-    ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34'])
+    ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated'])
     ap.add_argument('--cpu', action='store_true')
     infer(ap.parse_args())
 
