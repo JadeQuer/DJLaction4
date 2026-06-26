@@ -14,12 +14,17 @@ import numpy as np
 
 BIG_SCREEN_IMAGE = Path("/root/autodl-tmp/DJLaction4/image.png")
 SMALL_SCREEN_IMAGE = Path("/root/autodl-tmp/DJLaction4/image2.png")
+DJI_LABEL_IMAGE = None
 BIG_SCREEN_INSET = 0.08
 SMALL_SCREEN_SIDE_RATIO = 0.88
 SMALL_SCREEN_X_MARGIN_RATIO = 0.075
 SMALL_SCREEN_Y_SCALE = 1.0
 SMALL_SCREEN_OVERALL_SCALE = 0.95
 SMALL_SCREEN_OFFSET_RATIO = 0.0015
+DJI_LABEL_YMAX_WIDTH_RATIO = 0.51
+DJI_LABEL_YMAX_CENTER_X_RATIO = 0.56
+DJI_LABEL_YMAX_CENTER_Z_RATIO = 0.84
+DJI_LABEL_YMAX_OFFSET_RATIO = 0.0012
 
 
 def clear_scene():
@@ -108,6 +113,9 @@ def make_image_emission_material(name, image_path, emission_strength=0.9, roughn
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     mat.use_backface_culling = False
+    mat.blend_method = "BLEND"
+    mat.use_screen_refraction = False
+    mat.show_transparent_back = True
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
     for node in list(nodes):
@@ -125,6 +133,8 @@ def make_image_emission_material(name, image_path, emission_strength=0.9, roughn
         links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
     elif "Emission Color" in bsdf.inputs:
         links.new(tex.outputs["Color"], bsdf.inputs["Emission Color"])
+    if "Alpha" in bsdf.inputs:
+        links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
     links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
     return mat
 
@@ -259,6 +269,58 @@ def add_dji_label_on_ymax_face(obj, text="dji-004", offset_ratio=0.012):
     txt.parent = obj
     txt.data.materials.append(make_principled_material("dji_label_black", (0.045, 0.045, 0.04, 1.0), roughness=0.6))
     return label, txt
+
+
+def add_dji_label_image_on_ymax_face(
+    obj,
+    image_path,
+    width_ratio=DJI_LABEL_YMAX_WIDTH_RATIO,
+    center_x_ratio=DJI_LABEL_YMAX_CENTER_X_RATIO,
+    center_z_ratio=DJI_LABEL_YMAX_CENTER_Z_RATIO,
+    offset_ratio=DJI_LABEL_YMAX_OFFSET_RATIO,
+):
+    xs = [corner[0] for corner in obj.bound_box]
+    ys = [corner[1] for corner in obj.bound_box]
+    zs = [corner[2] for corner in obj.bound_box]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    minz, maxz = min(zs), max(zs)
+    dx, dy, dz = maxx - minx, maxy - miny, maxz - minz
+    max_dim = max(dx, dy, dz)
+
+    aspect = 3.1
+    try:
+        img = bpy.data.images.load(str(image_path), check_existing=True)
+        aspect = max(float(img.size[0]), 1.0) / max(float(img.size[1]), 1.0)
+    except Exception:
+        img = None
+
+    label_w = dx * width_ratio
+    label_h = min(label_w / aspect, dz * 0.20)
+    cx = minx + dx * center_x_ratio
+    cz = minz + dz * center_z_ratio
+    y = maxy + max_dim * offset_ratio
+
+    x_lo, x_hi = cx - label_w * 0.5, cx + label_w * 0.5
+    z_lo, z_hi = cz - label_h * 0.5, cz + label_h * 0.5
+    verts = [
+        (x_lo, y, z_lo),
+        (x_hi, y, z_lo),
+        (x_hi, y, z_hi),
+        (x_lo, y, z_hi),
+    ]
+    mesh = bpy.data.meshes.new("djiLabelImageMesh")
+    mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+    mesh.update()
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for loop, uv in zip(mesh.polygons[0].loop_indices, [(0, 0), (1, 0), (1, 1), (0, 1)]):
+        uv_layer.data[loop].uv = uv
+
+    label = bpy.data.objects.new("dji_label_image_ymax_face", mesh)
+    bpy.context.collection.objects.link(label)
+    label.parent = obj
+    label.data.materials.append(make_image_emission_material("dji_label_image_material", image_path, emission_strength=0.25, roughness=0.45))
+    return label
 
 
 def add_local_box(obj, name, center, size, mat):
@@ -1247,6 +1309,8 @@ def main():
         overall_scale=SMALL_SCREEN_OVERALL_SCALE,
         offset_ratio=SMALL_SCREEN_OFFSET_RATIO,
     )
+    if DJI_LABEL_IMAGE is not None and DJI_LABEL_IMAGE.exists():
+        add_dji_label_image_on_ymax_face(obj, DJI_LABEL_IMAGE)
     if args.dji_label:
         add_dji_label_on_ymax_face(obj, text=args.dji_label)
 

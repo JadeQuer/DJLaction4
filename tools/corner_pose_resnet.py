@@ -11,6 +11,13 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import models
 
 
+BOX_EDGE_INDEX_PAIRS = (
+    (0, 1), (1, 3), (3, 2), (2, 0),
+    (4, 5), (5, 7), (7, 6), (6, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+
+
 def bbox_from_points(points, w, h, pad_ratio=0.35, jitter=0.0, square=False):
     pts = np.asarray(points, dtype=np.float32)
     x1, y1 = pts[:, 0].min(), pts[:, 1].min()
@@ -64,6 +71,15 @@ def resize_letterbox(img, out_size, fill=(114, 114, 114)):
         'out_h': int(out_h),
     }
     return canvas, meta
+
+
+def append_coord_channels(img):
+    h, w = img.shape[:2]
+    xs = np.linspace(-1.0, 1.0, w, dtype=np.float32)
+    ys = np.linspace(-1.0, 1.0, h, dtype=np.float32)
+    grid_x = np.tile(xs[None, :], (h, 1))
+    grid_y = np.tile(ys[:, None], (1, w))
+    return np.concatenate([img, grid_x[:, :, None], grid_y[:, :, None]], axis=2)
 
 
 def crop_and_resize(img, bbox, out_size, keep_aspect=True):
@@ -183,6 +199,7 @@ class CornerDataset(Dataset):
         train=True,
         aug=True,
         geometry_aug=False,
+        coord_conv=False,
     ):
         self.root = Path(root)
         self.labels = sorted((self.root / 'labels').glob('*.json'))
@@ -197,6 +214,7 @@ class CornerDataset(Dataset):
         self.train = train
         self.aug = aug
         self.geometry_aug = geometry_aug
+        self.coord_conv = coord_conv
         if not self.labels:
             raise RuntimeError(f'No labels found under {self.root / "labels"}')
 
@@ -253,6 +271,8 @@ class CornerDataset(Dataset):
             img = apply_geometry_augment(img, corners)
         img = img.astype(np.float32) / 255.0
         img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        if self.coord_conv:
+            img = append_coord_channels(img)
         img = img.transpose(2, 0, 1)
         hms = self._heatmaps(corners, label_w, label_h)
         pts = np.array([[p[0] / label_w * self.hm_w, p[1] / label_h * self.hm_h] for p in corners], dtype=np.float32)
@@ -279,8 +299,136 @@ def _make_group_norm(num_channels):
     return nn.GroupNorm(num_groups=1, num_channels=num_channels)
 
 
+def build_2d_sincos_pos_embed(height, width, dim, device, dtype):
+    if dim % 4 != 0:
+        raise ValueError(f'pos embed dim must be divisible by 4, got {dim}')
+    pos_dim = dim // 4
+    omega = torch.arange(pos_dim, device=device, dtype=torch.float32)
+    omega = 1.0 / (10000 ** (omega / max(pos_dim, 1)))
+    grid_y = torch.arange(height, device=device, dtype=torch.float32)
+    grid_x = torch.arange(width, device=device, dtype=torch.float32)
+    yy, xx = torch.meshgrid(grid_y, grid_x, indexing='ij')
+    out_y = yy.reshape(-1, 1) * omega.reshape(1, -1)
+    out_x = xx.reshape(-1, 1) * omega.reshape(1, -1)
+    pos = torch.cat([torch.sin(out_y), torch.cos(out_y), torch.sin(out_x), torch.cos(out_x)], dim=1)
+    return pos.unsqueeze(0).to(device=device, dtype=dtype)
+
+
+class SpatialTokenMixer(nn.Module):
+    def __init__(self, dim=256, num_heads=4, mlp_ratio=2.0, dropout=0.0):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, feat):
+        b, c, h, w = feat.shape
+        x = feat.flatten(2).transpose(1, 2)
+        x = x + build_2d_sincos_pos_embed(h, w, c, feat.device, feat.dtype)
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)[0]
+        x = x + self.mlp(self.norm2(x))
+        return x.transpose(1, 2).reshape(b, c, h, w)
+
+
+
+class ConvNormAct(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+            _make_group_norm(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = ConvNormAct(in_channels, out_channels, stride=stride)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            _make_group_norm(out_channels),
+        )
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                _make_group_norm(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        return self.act(out + residual)
+
+
+class TeacherHeatmapNet(nn.Module):
+    def __init__(self, out_channels=8, heatmap_size=64, coord_conv=False, base_channels=48):
+        super().__init__()
+        in_channels = 5 if coord_conv else 3
+        self.output_wh = (heatmap_size, heatmap_size)
+        self.coord_conv = coord_conv
+        self.stem = nn.Sequential(
+            ConvNormAct(in_channels, base_channels, stride=2),
+            ResidualConvBlock(base_channels, base_channels),
+        )
+        self.stage1 = nn.Sequential(
+            ResidualConvBlock(base_channels, base_channels * 2, stride=2),
+            ResidualConvBlock(base_channels * 2, base_channels * 2),
+        )
+        self.stage2 = nn.Sequential(
+            ResidualConvBlock(base_channels * 2, base_channels * 4, stride=2),
+            ResidualConvBlock(base_channels * 4, base_channels * 4),
+            ResidualConvBlock(base_channels * 4, base_channels * 4),
+        )
+        self.neck = nn.Sequential(
+            ResidualConvBlock(base_channels * 4, base_channels * 4),
+            nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=1, bias=False),
+            _make_group_norm(base_channels * 2),
+            nn.GELU(),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=3, padding=1, bias=False),
+            _make_group_norm(base_channels * 2),
+            nn.GELU(),
+            ResidualConvBlock(base_channels * 2, base_channels * 2),
+            ResidualConvBlock(base_channels * 2, base_channels * 2),
+        )
+        self.head = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1, bias=False),
+            _make_group_norm(base_channels),
+            nn.GELU(),
+            nn.Conv2d(base_channels, out_channels, kernel_size=1),
+        )
+
+    def forward(self, x):
+        stem = self.stem(x)
+        feat64 = self.stage1(stem)
+        feat32 = self.stage2(feat64)
+        up64 = F.interpolate(self.neck(feat32), size=feat64.shape[-2:], mode='bilinear', align_corners=False)
+        fused = self.fuse(torch.cat([feat64, up64], dim=1))
+        heatmaps = self.head(fused)
+        if heatmaps.shape[-2:] != self.output_wh:
+            heatmaps = F.interpolate(heatmaps, size=self.output_wh, mode='bilinear', align_corners=False)
+        return heatmaps
+
+
 class ResNetCornerNet(nn.Module):
-    def __init__(self, backbone='resnet18', pretrained=True, out_channels=8, heatmap_size=64):
+    def __init__(self, backbone='resnet18', pretrained=True, out_channels=8, heatmap_size=64, coord_conv=False, token_mixer=False):
         super().__init__()
         if heatmap_size not in (64, 128):
             raise ValueError(f'Unsupported heatmap_size: {heatmap_size}; expected 64 or 128')
@@ -296,7 +444,19 @@ class ResNetCornerNet(nn.Module):
             raise ValueError(f'Unsupported backbone: {backbone}')
         if backbone.endswith('_dilated'):
             make_resnet_layer4_dilated(net)
-        self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
+        self.coord_conv = coord_conv
+        self.token_mixer_enabled = token_mixer
+        if coord_conv:
+            conv1 = nn.Conv2d(5, net.conv1.out_channels, kernel_size=net.conv1.kernel_size, stride=net.conv1.stride, padding=net.conv1.padding, bias=False)
+            with torch.no_grad():
+                conv1.weight[:, :3].copy_(net.conv1.weight)
+                coord_seed = net.conv1.weight.mean(dim=1, keepdim=True)
+                conv1.weight[:, 3:4].copy_(coord_seed * 0.5)
+                conv1.weight[:, 4:5].copy_(coord_seed * 0.5)
+            stem_conv = conv1
+        else:
+            stem_conv = net.conv1
+        self.stem = nn.Sequential(stem_conv, net.bn1, net.relu, net.maxpool)
         self.layer1 = net.layer1
         self.layer2 = net.layer2
         self.layer3 = net.layer3
@@ -310,6 +470,7 @@ class ResNetCornerNet(nn.Module):
         self.smooth4 = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1), _make_group_norm(256), nn.ReLU(inplace=True))
         self.smooth3 = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1), _make_group_norm(256), nn.ReLU(inplace=True))
         self.smooth2 = nn.Sequential(nn.Conv2d(256, 256, 3, padding=1), _make_group_norm(256), nn.ReLU(inplace=True))
+        self.token_mixer = SpatialTokenMixer(dim=256, num_heads=4, mlp_ratio=2.0, dropout=0.0) if token_mixer else nn.Identity()
 
         head_layers = [
             nn.Conv2d(256, 128, 3, padding=1),
@@ -336,6 +497,7 @@ class ResNetCornerNet(nn.Module):
         p5 = self.lat5(c5)
         p4 = self.smooth4(self._upsample_add(p5, self.lat4(c4)))
         p3 = self.smooth3(self._upsample_add(p4, self.lat3(c3)))
+        p3 = self.token_mixer(p3)
         p2 = self.smooth2(self._upsample_add(p3, self.lat2(c2)))
         heatmaps = self.head(p2)
         if heatmaps.shape[-2:] != self.output_wh:
@@ -343,8 +505,90 @@ class ResNetCornerNet(nn.Module):
         return heatmaps
 
 
-def decode_heatmaps(logits, topk=9):
+
+def build_pose_model(backbone, pretrained, heatmap_size, coord_conv=False, token_mixer=False):
+    if backbone == 'teacher_heatmap':
+        return TeacherHeatmapNet(out_channels=8, heatmap_size=heatmap_size, coord_conv=coord_conv, base_channels=48)
+    return ResNetCornerNet(
+        backbone=backbone,
+        pretrained=pretrained,
+        heatmap_size=heatmap_size,
+        coord_conv=coord_conv,
+        token_mixer=token_mixer,
+    )
+
+
+def softargmax_keypoints_from_logits(logits, temperature=0.05):
+    if logits.ndim != 4:
+        raise ValueError(f'Expected logits [B, K, H, W], got {tuple(logits.shape)}')
+    b, k, h, w = logits.shape
+    flat = logits.reshape(b, k, h * w)
+    weights = torch.softmax(flat / max(float(temperature), 1e-6), dim=-1)
+    xs = torch.arange(w, device=logits.device, dtype=logits.dtype).repeat(h).view(1, 1, -1)
+    ys = torch.arange(h, device=logits.device, dtype=logits.dtype).repeat_interleave(w).view(1, 1, -1)
+    x = torch.sum(weights * xs, dim=-1)
+    y = torch.sum(weights * ys, dim=-1)
+    return torch.stack([x, y], dim=-1)
+
+
+def normalize_keypoints_xy(points, heatmap_w, heatmap_h):
+    denom = points.new_tensor([max(float(heatmap_w - 1), 1.0), max(float(heatmap_h - 1), 1.0)])
+    return points / denom.view(1, 1, 2)
+
+
+def coordinate_structure_loss(logits, target_pts, coord_weight=0.0, edge_weight=0.0, temperature=0.05, beta=0.05):
+    if coord_weight <= 0.0 and edge_weight <= 0.0:
+        return logits.new_zeros(()), logits.new_zeros(())
+    pred_pts = softargmax_keypoints_from_logits(logits, temperature=temperature)
+    heatmap_h, heatmap_w = logits.shape[-2:]
+    pred_norm = normalize_keypoints_xy(pred_pts, heatmap_w, heatmap_h)
+    target_norm = normalize_keypoints_xy(target_pts.to(logits.device), heatmap_w, heatmap_h)
+
+    coord_loss = logits.new_zeros(())
+    if coord_weight > 0.0:
+        coord_loss = F.smooth_l1_loss(pred_norm, target_norm, beta=beta)
+
+    edge_loss = logits.new_zeros(())
+    if edge_weight > 0.0:
+        pred_edges = []
+        target_edges = []
+        for a, b in BOX_EDGE_INDEX_PAIRS:
+            pred_edges.append(pred_norm[:, b] - pred_norm[:, a])
+            target_edges.append(target_norm[:, b] - target_norm[:, a])
+        edge_loss = F.smooth_l1_loss(torch.stack(pred_edges, dim=1), torch.stack(target_edges, dim=1), beta=beta)
+    return coord_loss, edge_loss
+
+
+def heatmap_supervision_loss(pred_sigmoid, target, loss_type='mse_bce', positive_weight=0.0, positive_gamma=2.0):
+    if loss_type == 'mse_bce':
+        loss_mse = F.mse_loss(pred_sigmoid, target)
+        loss_bce = F.binary_cross_entropy(pred_sigmoid.clamp(1e-5, 1 - 1e-5), target)
+        return loss_mse + 0.5 * loss_bce
+    if loss_type == 'mse':
+        if positive_weight > 0.0:
+            weights = 1.0 + float(positive_weight) * torch.pow(target.clamp(0.0, 1.0), float(positive_gamma))
+            return ((pred_sigmoid - target) ** 2 * weights).sum() / weights.sum().clamp_min(1.0)
+        return F.mse_loss(pred_sigmoid, target)
+    if loss_type == 'smooth_l1':
+        return F.smooth_l1_loss(pred_sigmoid, target, beta=0.05)
+    if loss_type == 'focal':
+        pred = pred_sigmoid.clamp(1e-4, 1.0 - 1e-4)
+        pos_mask = (target >= 0.99).to(dtype=pred.dtype)
+        neg_mask = (target < 0.99).to(dtype=pred.dtype)
+        neg_weights = torch.pow(1.0 - target.clamp(0.0, 1.0), 4.0)
+        pos_loss = torch.log(pred) * torch.pow(1.0 - pred, 2.0) * pos_mask
+        neg_loss = torch.log(1.0 - pred) * torch.pow(pred, 2.0) * neg_weights * neg_mask
+        num_pos = pos_mask.sum()
+        if num_pos > 0:
+            return -(pos_loss.sum() + neg_loss.sum()) / num_pos
+        return -neg_loss.sum() / neg_mask.sum().clamp_min(1.0)
+    raise ValueError(f'Unsupported heatmap loss: {loss_type}')
+
+
+def decode_heatmaps(logits, topk=9, mode='topk_mean', temperature=0.05):
     hms = torch.sigmoid(logits).detach().cpu().numpy()
+    if mode not in {'topk_mean', 'argmax', 'softargmax'}:
+        raise ValueError(f'Unsupported decode mode: {mode}')
     pts = []
     conf = []
     for b in range(hms.shape[0]):
@@ -353,6 +597,22 @@ def decode_heatmaps(logits, topk=9):
         for k in range(8):
             hm = hms[b, k]
             flat = hm.reshape(-1)
+            if mode == 'argmax':
+                idx = int(np.argmax(flat))
+                y, x = divmod(idx, hm.shape[1])
+                bpts.append([float(x) + 0.5, float(y) + 0.5])
+                bconf.append(float(flat[idx]))
+                continue
+            if mode == 'softargmax':
+                scores = flat.astype(np.float32)
+                logits_np = scores / max(float(temperature), 1e-6)
+                logits_np = logits_np - float(np.max(logits_np))
+                weights = np.exp(logits_np)
+                weights = weights / max(float(np.sum(weights)), 1e-12)
+                ys, xs = np.divmod(np.arange(flat.shape[0]), hm.shape[1])
+                bpts.append([float(np.sum(xs * weights)), float(np.sum(ys * weights))])
+                bconf.append(float(np.max(scores)))
+                continue
             kk = min(topk, flat.shape[0])
             idxs = np.argpartition(flat, -kk)[-kk:]
             scores = flat[idxs]
@@ -367,7 +627,7 @@ def decode_heatmaps(logits, topk=9):
     return np.array(pts, dtype=np.float32), np.array(conf, dtype=np.float32)
 
 
-def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_meta=False):
+def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_meta=False, coord_conv=False):
     if keep_aspect:
         img_u8, meta = resize_letterbox(frame, image_size)
     else:
@@ -382,6 +642,8 @@ def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_met
         }
     img = img_u8.astype(np.float32) / 255.0
     img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    if coord_conv:
+        img = append_coord_channels(img)
     tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
     if return_meta:
         return tensor, meta
@@ -421,6 +683,7 @@ def train(args):
         train=True,
         aug=args.augment,
         geometry_aug=args.geometry_augment,
+        coord_conv=args.coord_conv,
     )
     val_base = CornerDataset(
         args.data,
@@ -435,6 +698,7 @@ def train(args):
         train=False,
         aug=False,
         geometry_aug=False,
+        coord_conv=args.coord_conv,
     )
     total = len(train_base)
     n_val = max(1, int(total * 0.15))
@@ -445,33 +709,67 @@ def train(args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    model = ResNetCornerNet(backbone=args.backbone, pretrained=not args.no_pretrained, heatmap_size=args.heatmap_size).to(device)
+    model = build_pose_model(args.backbone, pretrained=not args.no_pretrained, heatmap_size=args.heatmap_size, coord_conv=args.coord_conv, token_mixer=args.token_mixer).to(device)
     if getattr(args, 'init_ckpt', None):
         ckpt = torch.load(args.init_ckpt, map_location=device)
         state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
         model.load_state_dict(state, strict=True)
         print(f'loaded init checkpoint: {args.init_ckpt}')
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    total_steps = max(1, args.epochs * len(train_loader))
+    warmup_steps = min(max(0, args.warmup_steps), total_steps - 1)
+    scheduler = None
+    if args.scheduler == 'cosine':
+        def lr_lambda(step):
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+            min_ratio = args.min_lr / max(args.lr, 1e-12)
+            return float(min_ratio + (1.0 - min_ratio) * cosine)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
     best = 1e9
+    best_epoch = 0
+    stale_epochs = 0
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
-        for img, hm, _ in train_loader:
+        train_coord_loss = 0.0
+        train_edge_loss = 0.0
+        for img, hm, pts in train_loader:
             img = img.to(device)
             hm = hm.to(device)
             pred = model(img)
             pred_sigmoid = torch.sigmoid(pred)
-            loss_mse = F.mse_loss(pred_sigmoid, hm)
-            loss_bce = F.binary_cross_entropy(pred_sigmoid.clamp(1e-5, 1 - 1e-5), hm)
-            loss = loss_mse + 0.5 * loss_bce
+            heatmap_loss = heatmap_supervision_loss(
+                pred_sigmoid,
+                hm,
+                loss_type=args.heatmap_loss,
+                positive_weight=args.positive_weight,
+                positive_gamma=args.positive_gamma,
+            )
+            coord_loss, edge_loss = coordinate_structure_loss(
+                pred,
+                pts.to(device),
+                coord_weight=args.coord_loss_weight,
+                edge_weight=args.edge_loss_weight,
+                temperature=args.softargmax_temperature,
+            )
+            loss = heatmap_loss + args.coord_loss_weight * coord_loss + args.edge_loss_weight * edge_loss
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
             train_loss += loss.item() * img.size(0)
+            train_coord_loss += coord_loss.item() * img.size(0)
+            train_edge_loss += edge_loss.item() * img.size(0)
         train_loss /= len(train_ds)
+        train_coord_loss /= len(train_ds)
+        train_edge_loss /= len(train_ds)
 
         model.eval()
         val_loss = 0.0
@@ -483,25 +781,52 @@ def train(args):
                 hm = hm.to(device)
                 pred = model(img)
                 pred_sigmoid = torch.sigmoid(pred)
-                loss_mse = F.mse_loss(pred_sigmoid, hm)
-                loss_bce = F.binary_cross_entropy(pred_sigmoid.clamp(1e-5, 1 - 1e-5), hm)
-                val_loss += (loss_mse + 0.5 * loss_bce).item() * img.size(0)
-                ppts, _ = decode_heatmaps(pred)
+                heatmap_loss = heatmap_supervision_loss(
+                    pred_sigmoid,
+                    hm,
+                    loss_type=args.heatmap_loss,
+                    positive_weight=args.positive_weight,
+                    positive_gamma=args.positive_gamma,
+                )
+                coord_loss, edge_loss = coordinate_structure_loss(
+                    pred,
+                    pts.to(device),
+                    coord_weight=args.coord_loss_weight,
+                    edge_weight=args.edge_loss_weight,
+                    temperature=args.softargmax_temperature,
+                )
+                total_val_loss = heatmap_loss + args.coord_loss_weight * coord_loss + args.edge_loss_weight * edge_loss
+                val_loss += total_val_loss.item() * img.size(0)
+                ppts, _ = decode_heatmaps(pred, topk=args.decode_topk, mode=args.decode_mode, temperature=args.softargmax_temperature)
                 err = np.linalg.norm(ppts - pts.numpy(), axis=-1).mean()
                 val_err += err * img.size(0)
                 count += img.size(0)
         val_loss /= len(val_ds)
         val_err /= max(1, count)
-        print(f'epoch {epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_err_hm_px={val_err:.2f}')
-        if val_loss < best:
+        current_lr = opt.param_groups[0]['lr']
+        print(f'epoch {epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_err_hm_px={val_err:.2f} coord_loss={train_coord_loss:.6f} edge_loss={train_edge_loss:.6f} lr={current_lr:.6g} loss={args.heatmap_loss} decode={args.decode_mode}')
+        if val_loss < best - args.early_stop_min_delta:
             best = val_loss
-            torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, out / 'best.pt')
-    torch.save({'model': model.state_dict(), 'epoch': args.epochs, 'args': vars(args)}, out / 'last.pt')
+            best_epoch = epoch
+            stale_epochs = 0
+            torch.save({
+                'model': model.state_dict(),
+                'epoch': epoch,
+                'args': vars(args),
+                'best_val_loss': float(val_loss),
+                'best_val_err_hm_px': float(val_err),
+            }, out / 'best.pt')
+        else:
+            stale_epochs += 1
+        if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+            print(f'early stopping at epoch {epoch:03d}; best_epoch={best_epoch:03d} best_val_loss={best:.6f} patience={args.early_stop_patience}')
+            break
+    torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, out / 'last.pt')
 
 
 def infer_video(args):
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
-    model = ResNetCornerNet(backbone=args.backbone, pretrained=False, heatmap_size=args.heatmap_size).to(device)
+    model = build_pose_model(args.backbone, pretrained=False, heatmap_size=args.heatmap_size, coord_conv=args.coord_conv, token_mixer=args.token_mixer).to(device)
     ckpt = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -528,9 +853,9 @@ def infer_video(args):
             if frame_idx % args.stride != 0:
                 frame_idx += 1
                 continue
-            x = preprocess_frame(frame, image_size=(args.image_size, args.image_size)).to(device)
+            x = preprocess_frame(frame, image_size=(args.image_size, args.image_size), coord_conv=args.coord_conv).to(device)
             logits = model(x)
-            pts, conf = decode_heatmaps(logits)
+            pts, conf = decode_heatmaps(logits, topk=args.decode_topk, mode=args.decode_mode, temperature=args.softargmax_temperature)
             vis = frame.copy()
             draw_prediction(vis, pts[0], conf[0], heatmap_size=(args.heatmap_size, args.heatmap_size))
             vis = cv2.resize(vis, (out_w, out_h), interpolation=cv2.INTER_AREA)
@@ -550,6 +875,9 @@ def infer_video(args):
         'min_conf': float(np.min(stats)) if stats else 0.0,
         'max_conf': float(np.max(stats)) if stats else 0.0,
         'backbone': args.backbone,
+        'decode_mode': args.decode_mode,
+        'decode_topk': args.decode_topk,
+        'softargmax_temperature': args.softargmax_temperature,
     }
     Path(args.out).with_suffix('.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps(report, indent=2))
@@ -565,7 +893,11 @@ def main():
     p.add_argument('--epochs', type=int, default=80)
     p.add_argument('--batch-size', type=int, default=16)
     p.add_argument('--lr', type=float, default=1e-3)
-    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated'])
+    p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--scheduler', default='none', choices=['none', 'cosine'])
+    p.add_argument('--warmup-steps', type=int, default=0)
+    p.add_argument('--min-lr', type=float, default=1e-6)
+    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap'])
     p.add_argument('--image-size', type=int, default=256)
     p.add_argument('--heatmap-size', type=int, default=64)
     p.add_argument('--sigma', type=float, default=1.8)
@@ -578,6 +910,18 @@ def main():
     p.add_argument('--geometry-augment', action='store_true')
     p.add_argument('--init-ckpt')
     p.add_argument('--no-pretrained', action='store_true')
+    p.add_argument('--coord-conv', action='store_true')
+    p.add_argument('--token-mixer', action='store_true')
+    p.add_argument('--decode-mode', default='topk_mean', choices=['topk_mean', 'argmax', 'softargmax'])
+    p.add_argument('--decode-topk', type=int, default=9)
+    p.add_argument('--softargmax-temperature', type=float, default=0.05)
+    p.add_argument('--heatmap-loss', default='mse_bce', choices=['mse_bce', 'mse', 'smooth_l1', 'focal'])
+    p.add_argument('--positive-weight', type=float, default=0.0)
+    p.add_argument('--positive-gamma', type=float, default=2.0)
+    p.add_argument('--coord-loss-weight', type=float, default=0.0)
+    p.add_argument('--edge-loss-weight', type=float, default=0.0)
+    p.add_argument('--early-stop-patience', type=int, default=0)
+    p.add_argument('--early-stop-min-delta', type=float, default=0.0)
     p.add_argument('--cpu', action='store_true')
     p.set_defaults(func=train)
 
@@ -588,9 +932,14 @@ def main():
     p.add_argument('--stride', type=int, default=3)
     p.add_argument('--max-frames', type=int, default=300)
     p.add_argument('--output-width', type=int, default=960)
-    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated'])
+    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap'])
     p.add_argument('--image-size', type=int, default=256)
     p.add_argument('--heatmap-size', type=int, default=64)
+    p.add_argument('--coord-conv', action='store_true')
+    p.add_argument('--token-mixer', action='store_true')
+    p.add_argument('--decode-mode', default='topk_mean', choices=['topk_mean', 'argmax', 'softargmax'])
+    p.add_argument('--decode-topk', type=int, default=9)
+    p.add_argument('--softargmax-temperature', type=float, default=0.05)
     p.add_argument('--cpu', action='store_true')
     p.set_defaults(func=infer_video)
 

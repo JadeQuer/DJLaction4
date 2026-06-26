@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from corner_pose_resnet import ResNetCornerNet, decode_heatmaps, preprocess_frame
+from corner_pose_resnet import build_pose_model, decode_heatmaps, preprocess_frame
 
 
 FIXED_DJI_ACTION4_DETECTOR = 'runs_pre/detect/runs/dji_action4_yolo_real_full_ft/weights/best.pt'
@@ -114,7 +114,7 @@ def infer(args):
     if not Path(detector_path).exists():
         raise FileNotFoundError(f'Fixed DJI Action 4 detector not found: {detector_path}')
     detector = YOLO(detector_path)
-    model = ResNetCornerNet(backbone=args.backbone, pretrained=False, heatmap_size=args.heatmap_size).to(device)
+    model = build_pose_model(args.backbone, pretrained=False, heatmap_size=args.heatmap_size, coord_conv=args.coord_conv, token_mixer=args.token_mixer).to(device)
     ckpt = torch.load(args.corner_ckpt, map_location=device)
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -156,10 +156,11 @@ def infer(args):
                     image_size=(args.image_size, args.image_size),
                     keep_aspect=not args.stretch_roi,
                     return_meta=True,
+                    coord_conv=args.coord_conv,
                 )
                 inp = inp.to(device)
                 logits = model(inp)
-                pts, kpt_conf = decode_heatmaps(logits)
+                pts, kpt_conf = decode_heatmaps(logits, topk=args.decode_topk, mode=args.decode_mode, temperature=args.softargmax_temperature)
                 full_pts = project_heatmap_points_to_frame(
                     pts[0],
                     (x1, y1, x2, y2),
@@ -201,6 +202,9 @@ def infer(args):
         'roi_shrink': args.roi_shrink,
         'stretch_roi': args.stretch_roi,
         'backbone': args.backbone,
+        'decode_mode': args.decode_mode,
+        'decode_topk': args.decode_topk,
+        'softargmax_temperature': args.softargmax_temperature,
     }
     Path(args.out).with_suffix('.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps(report, indent=2))
@@ -225,7 +229,12 @@ def main():
     ap.add_argument('--stretch-roi', action='store_true')
     ap.add_argument('--debug-dir')
     ap.add_argument('--debug-frames', type=int, default=24)
-    ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated'])
+    ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap'])
+    ap.add_argument('--coord-conv', action='store_true')
+    ap.add_argument('--token-mixer', action='store_true')
+    ap.add_argument('--decode-mode', default='topk_mean', choices=['topk_mean', 'argmax', 'softargmax'])
+    ap.add_argument('--decode-topk', type=int, default=9)
+    ap.add_argument('--softargmax-temperature', type=float, default=0.05)
     ap.add_argument('--cpu', action='store_true')
     infer(ap.parse_args())
 
