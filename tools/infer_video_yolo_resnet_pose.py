@@ -10,6 +10,9 @@ from ultralytics import YOLO
 from corner_pose_resnet import ResNetCornerNet, decode_heatmaps, preprocess_frame
 
 
+FIXED_DJI_ACTION4_DETECTOR = 'runs_pre/detect/runs/dji_action4_yolo_real_full_ft/weights/best.pt'
+
+
 def train(*_args, **_kwargs):
     # Compatibility shim for checkpoints that stored argparse's func=train.
     pass
@@ -107,7 +110,10 @@ def draw_frame_points(frame, full_pts, bbox, roi_id, det_score=None):
 
 def infer(args):
     device = 'cuda' if torch.cuda.is_available() and not args.cpu else 'cpu'
-    detector = YOLO(args.detector)
+    detector_path = FIXED_DJI_ACTION4_DETECTOR
+    if not Path(detector_path).exists():
+        raise FileNotFoundError(f'Fixed DJI Action 4 detector not found: {detector_path}')
+    detector = YOLO(detector_path)
     model = ResNetCornerNet(backbone=args.backbone, pretrained=False).to(device)
     ckpt = torch.load(args.corner_ckpt, map_location=device)
     model.load_state_dict(ckpt['model'])
@@ -182,7 +188,7 @@ def infer(args):
     report = {
         'video': args.video,
         'output': args.out,
-        'detector': args.detector,
+        'detector': detector_path,
         'corner_ckpt': args.corner_ckpt,
         'frames_written': written,
         'mean_yolo_rois': float(np.mean(det_count_stats)) if det_count_stats else 0.0,
@@ -202,7 +208,6 @@ def infer(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--detector', default='runs/detect/runs/dji_action4_yolo_real_full_ft/weights/best.pt')
     ap.add_argument('--corner-ckpt', default='runs/corner_resnet18_aug_roi/best.pt')
     ap.add_argument('--video', default='/root/autodl-fs/head_left_rgb_raw.mp4')
     ap.add_argument('--out', default='runs/corner_resnet18_aug_roi/head_left_rgb_raw_yolo_conf025_pose.mp4')

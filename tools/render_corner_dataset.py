@@ -384,6 +384,37 @@ def world_to_pixel(scene, camera, point):
     return [float(co.x * width), float((1.0 - co.y) * height), float(co.z)]
 
 
+def keep_zmin_face_down(scene, camera, world_corners):
+    """Roll the camera so the z_min face reads as a lower/bottom face in the image."""
+    zmin_center = sum((world_corners[i] for i in (0, 2, 6, 4)), mathutils.Vector()) / 4.0
+    zmax_center = sum((world_corners[i] for i in (1, 3, 7, 5)), mathutils.Vector()) / 4.0
+    edge_02_center = (world_corners[0] + world_corners[2]) / 2.0
+    edge_46_center = (world_corners[4] + world_corners[6]) / 2.0
+    base_quat = camera.rotation_euler.to_quaternion()
+    best_rotation = camera.rotation_euler.copy()
+    best_score = -1e9
+    for step in range(180):
+        angle = math.tau * step / 180.0
+        camera.rotation_euler = (base_quat @ mathutils.Quaternion((0.0, 0.0, 1.0), angle)).to_euler()
+        bpy.context.view_layer.update()
+        zmin_px = world_to_pixel(scene, camera, zmin_center)
+        zmax_px = world_to_pixel(scene, camera, zmax_center)
+        e02_px = world_to_pixel(scene, camera, edge_02_center)
+        e46_px = world_to_pixel(scene, camera, edge_46_center)
+        face_dx = zmin_px[0] - zmax_px[0]
+        face_dy = zmin_px[1] - zmax_px[1]
+        edge_dx = e46_px[0] - e02_px[0]
+        edge_dy = e46_px[1] - e02_px[1]
+        # Make the z_min face's 0-2 / 4-6 edge pair separate vertically
+        # instead of left-right; either edge can be above depending on view.
+        score = abs(edge_dy) * 3.0 - abs(edge_dx) * 4.0 + face_dy * 0.15 - abs(face_dx) * 0.05
+        if score > best_score:
+            best_score = score
+            best_rotation = camera.rotation_euler.copy()
+    camera.rotation_euler = best_rotation
+    bpy.context.view_layer.update()
+
+
 def bbox_corners_from_info(info):
     xs = [info["min_x"], info["max_x"]]
     ys = [info["min_y"], info["max_y"]]
@@ -445,6 +476,34 @@ def composite_cropped_foreground_on_background(image_path, bg_dir):
     comp = np.clip(fg * alpha + bg * (1.0 - alpha), 0, 255).astype(np.uint8)
     cv2.imwrite(str(image_path), comp)
     return True
+
+
+def post3s_roi_side(sample_index):
+    if sample_index % 16 < 3:
+        return None
+    return "left" if (sample_index - 3) % 2 == 0 else "right"
+
+
+def select_background_dir(args, sample_index):
+    if args.view_mode != "front_then_sides":
+        return args.background_dir
+    cycle = sample_index % 16
+    front_dir = Path("assets/yolo_roi_bg_front3s_grabcut_light_preview_8")
+    side_dir = Path("assets/yolo_roi_bg_after3s_side_clean")
+    left_dir = Path("assets/yolo_roi_bg_after3s_side_clean_left")
+    right_dir = Path("assets/yolo_roi_bg_after3s_side_clean_right")
+    if cycle < 3 and front_dir.exists():
+        return front_dir
+    side = post3s_roi_side(sample_index)
+    # The extracted ROI background folders were named opposite to the
+    # user's left/right hand interpretation, so intentionally swap them here.
+    if side == "left" and right_dir.exists():
+        return right_dir
+    if side == "right" and left_dir.exists():
+        return left_dir
+    if side_dir.exists():
+        return side_dir
+    return args.background_dir
 
 
 def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size, post_effects=False, pad_px=None, final_pad_px=None, square_crop=True):
@@ -513,13 +572,18 @@ def crop_render_and_points(image_path, corners_2d, out_path, pad_ratio, out_size
     if post_effects:
         alpha = crop[:, :, 3:4] if crop.ndim == 3 and crop.shape[2] == 4 else None
         color = crop[:, :, :3] if alpha is not None else crop
-        if random.random() < 0.35:
-            color = cv2.GaussianBlur(color, (3, 3), random.uniform(0.20, 0.45))
+        if random.random() < 0.28:
+            color = cv2.GaussianBlur(color, (3, 3), random.uniform(0.20, 0.60))
         crop_f = color.astype(np.float32)
-        crop_f = np.clip(crop_f * random.uniform(1.06, 1.18) + random.uniform(2.0, 8.0), 0, 255)
-        if random.random() < 0.35:
-            noise = np.random.normal(0.0, random.uniform(0.8, 2.0), crop_f.shape).astype(np.float32)
+        if random.random() < 0.60:
+            crop_f = crop_f * random.uniform(0.78, 1.20) + random.uniform(-16.0, 12.0)
+        if random.random() < 0.22:
+            gray = crop_f.mean(axis=2, keepdims=True)
+            crop_f = gray + (crop_f - gray) * random.uniform(0.82, 1.14)
+        if random.random() < 0.30:
+            noise = np.random.normal(0.0, random.uniform(0.8, 2.4), crop_f.shape).astype(np.float32)
             crop_f = np.clip(crop_f + noise, 0, 255)
+        crop_f = np.clip(crop_f, 0, 255)
         color = crop_f.astype(np.uint8)
         crop = np.concatenate([color, alpha], axis=2) if alpha is not None else color
     cv2.imwrite(str(out_path), crop)
@@ -702,25 +766,77 @@ def tilted_screen_front_camera_direction(sample_index, jitter=0.14):
     return v.normalized()
 
 
-def front_then_side_camera_direction(sample_index, jitter=0.16):
+def front_then_side_camera_direction(sample_index, jitter=0.16, roi_side=None):
     """A deterministic preview/training mix: a few screen-front views, then side-dominant views."""
     cycle = sample_index % 16
     if cycle < 3:
         return tilted_screen_front_camera_direction(cycle, jitter=jitter * 0.75)
+    if roi_side == "left":
+        base_pool = [
+            mathutils.Vector((1.0, 0.34, 0.06)),
+            mathutils.Vector((1.0, -0.38, -0.05)),
+            mathutils.Vector((1.0, 0.50, -0.10)),
+            mathutils.Vector((1.0, -0.54, 0.10)),
+            mathutils.Vector((1.0, 0.18, 0.18)),
+            mathutils.Vector((1.0, -0.20, -0.18)),
+            mathutils.Vector((1.0, 0.62, 0.04)),
+            mathutils.Vector((0.82, 0.52, -0.36)),
+            mathutils.Vector((0.82, -0.48, 0.34)),
+            mathutils.Vector((0.72, 0.18, -0.62)),
+            mathutils.Vector((0.72, -0.16, 0.58)),
+            mathutils.Vector((0.58, 0.74, -0.18)),
+            mathutils.Vector((0.58, -0.72, 0.16)),
+            mathutils.Vector((0.42, -1.0, 0.16)),
+            mathutils.Vector((0.38, -1.0, -0.28)),
+            mathutils.Vector((0.62, -0.86, 0.42)),
+        ]
+        base = base_pool[(cycle - 3) % len(base_pool)]
+        v = base + mathutils.Vector((
+            random.uniform(-jitter * 0.35, jitter * 0.35),
+            random.uniform(-jitter, jitter),
+            random.uniform(-jitter, jitter),
+        ))
+        return v.normalized()
+    if roi_side == "right":
+        base_pool = [
+            mathutils.Vector((-1.0, 0.34, -0.06)),
+            mathutils.Vector((-1.0, -0.38, 0.05)),
+            mathutils.Vector((-1.0, 0.50, 0.10)),
+            mathutils.Vector((-1.0, -0.54, -0.10)),
+            mathutils.Vector((-1.0, -0.18, -0.18)),
+            mathutils.Vector((-1.0, 0.20, 0.18)),
+            mathutils.Vector((-1.0, 0.62, -0.04)),
+            mathutils.Vector((-0.82, 0.52, 0.36)),
+            mathutils.Vector((-0.82, -0.48, -0.34)),
+            mathutils.Vector((-0.72, 0.18, 0.62)),
+            mathutils.Vector((-0.72, -0.16, -0.58)),
+            mathutils.Vector((-0.58, 0.74, 0.18)),
+            mathutils.Vector((-0.58, -0.72, -0.16)),
+            mathutils.Vector((-0.42, -1.0, -0.16)),
+            mathutils.Vector((-0.38, -1.0, 0.28)),
+            mathutils.Vector((-0.62, -0.86, -0.42)),
+        ]
+        base = base_pool[(cycle - 3) % len(base_pool)]
+        v = base + mathutils.Vector((
+            random.uniform(-jitter * 0.35, jitter * 0.35),
+            random.uniform(-jitter, jitter),
+            random.uniform(-jitter, jitter),
+        ))
+        return v.normalized()
     side_dirs = [
-        mathutils.Vector((1.0, 0.26, 0.16)),
-        mathutils.Vector((-1.0, 0.26, -0.16)),
-        mathutils.Vector((1.0, -0.30, -0.12)),
-        mathutils.Vector((-1.0, -0.30, 0.12)),
-        mathutils.Vector((0.20, 1.0, 0.18)),
-        mathutils.Vector((-0.22, 1.0, -0.16)),
-        mathutils.Vector((0.34, 0.18, 1.0)),
-        mathutils.Vector((-0.34, -0.18, 1.0)),
-        mathutils.Vector((0.30, 0.18, -1.0)),
-        mathutils.Vector((-0.30, -0.18, -1.0)),
-        mathutils.Vector((1.0, 0.42, -0.26)),
-        mathutils.Vector((-1.0, 0.42, 0.26)),
-        mathutils.Vector((1.0, -0.46, 0.24)),
+        mathutils.Vector((1.0, 0.34, 0.06)),
+        mathutils.Vector((-1.0, 0.34, -0.06)),
+        mathutils.Vector((1.0, -0.38, -0.05)),
+        mathutils.Vector((-1.0, -0.38, 0.05)),
+        mathutils.Vector((1.0, 0.50, -0.10)),
+        mathutils.Vector((-1.0, 0.50, 0.10)),
+        mathutils.Vector((1.0, -0.54, 0.10)),
+        mathutils.Vector((-1.0, -0.54, -0.10)),
+        mathutils.Vector((1.0, 0.18, 0.18)),
+        mathutils.Vector((-1.0, -0.18, -0.18)),
+        mathutils.Vector((1.0, -0.20, -0.18)),
+        mathutils.Vector((-1.0, 0.20, 0.18)),
+        mathutils.Vector((1.0, 0.62, 0.04)),
     ]
     base = side_dirs[(cycle - 3) % len(side_dirs)]
     v = base + mathutils.Vector((
@@ -729,6 +845,41 @@ def front_then_side_camera_direction(sample_index, jitter=0.16):
         random.uniform(-jitter, jitter),
     ))
     return v.normalized()
+
+
+def ymin_side_camera_direction(sample_index, jitter=0.16, roi_side=None):
+    """Views that deliberately expose the 0-1-5-4 / y_min face while keeping side context."""
+    if roi_side == "right":
+        x_sign = -1.0
+    elif roi_side == "left":
+        x_sign = 1.0
+    else:
+        x_sign = 1.0 if sample_index % 2 == 0 else -1.0
+    base_pool = [
+        mathutils.Vector((0.12 * x_sign, -1.0, 0.06)),
+        mathutils.Vector((0.20 * x_sign, -1.0, -0.14)),
+        mathutils.Vector((0.28 * x_sign, -1.0, 0.26)),
+        mathutils.Vector((0.36 * x_sign, -0.94, -0.30)),
+        mathutils.Vector((0.44 * x_sign, -0.90, 0.18)),
+        mathutils.Vector((0.18 * x_sign, -1.0, 0.42)),
+    ]
+    base = base_pool[sample_index % len(base_pool)]
+    v = base + mathutils.Vector((
+        random.uniform(-jitter * 0.55, jitter * 0.55),
+        random.uniform(-jitter * 0.35, jitter * 0.35),
+        random.uniform(-jitter, jitter),
+    ))
+    return v.normalized()
+
+
+def real_roi_shape_ok(corners_2d, sample_index, width, height, aspect_min, aspect_max, front_aspect_min, front_aspect_max):
+    pts = np.asarray([[p[0], p[1]] for p in corners_2d], dtype=np.float32)
+    bw = max(1.0, float(pts[:, 0].max() - pts[:, 0].min()))
+    bh = max(1.0, float(pts[:, 1].max() - pts[:, 1].min()))
+    aspect = bw / bh
+    if sample_index % 16 < 3:
+        return front_aspect_min <= aspect <= front_aspect_max
+    return aspect_min <= aspect <= aspect_max
 
 
 def polygon_area_2d(points):
@@ -979,7 +1130,8 @@ def main():
     parser.add_argument("--target-diameter", default=120.0, type=float)
     parser.add_argument("--add-decals", action="store_true")
     parser.add_argument("--dji-label", default=None)
-    parser.add_argument("--post-effects", action="store_true")
+    parser.add_argument("--post-effects", action="store_true", default=True)
+    parser.add_argument("--no-post-effects", dest="post_effects", action="store_false")
     parser.add_argument("--dof", action="store_true")
     parser.add_argument("--engine", default="cycles", choices=["eevee", "cycles"])
     parser.add_argument("--cycles-device", default="OPTIX", choices=["OPTIX", "CUDA"])
@@ -990,7 +1142,7 @@ def main():
     parser.add_argument("--light-scale", default=0.16, type=float)
     parser.add_argument("--background-level", default=0.60, type=float)
     parser.add_argument("--background-plane", action="store_true")
-    parser.add_argument("--background-dir", default=Path("assets/real_video_backgrounds_head_left_inpaint"), type=Path)
+    parser.add_argument("--background-dir", default=Path("assets/yolo_roi_bg_grabcut_light_mix_preview"), type=Path)
     parser.add_argument("--samples", default=24, type=int)
     parser.add_argument("--body-roughness", default=0.50, type=float)
     parser.add_argument("--body-color-scale", default=0.0001, type=float)
@@ -999,14 +1151,21 @@ def main():
     parser.add_argument("--reflection-scale", default=0.42, type=float)
     parser.add_argument("--orbit-camera", action="store_true", default=True)
     parser.add_argument("--front-camera", dest="orbit_camera", action="store_false")
-    parser.add_argument("--view-mode", default="real_corner_shapes", choices=["random_orbit", "balanced_faces", "real_video_like", "real_csv_faces", "real_corner_shapes", "direct_side_faces", "tilted_side_faces", "tilted_screen_front", "front_then_sides"])
+    parser.add_argument("--view-mode", default="front_then_sides", choices=["random_orbit", "balanced_faces", "real_video_like", "real_csv_faces", "real_corner_shapes", "direct_side_faces", "tilted_side_faces", "tilted_screen_front", "front_then_sides"])
+    parser.add_argument("--ymin-heavy", action="store_true")
     parser.add_argument("--view-jitter", default=0.16, type=float)
-    parser.add_argument("--real-like-filter", action="store_true", default=True)
+    parser.add_argument("--real-like-filter", action="store_true", default=False)
     parser.add_argument("--no-real-like-filter", dest="real_like_filter", action="store_false")
     parser.add_argument("--real-like-aspect-min", default=1.08, type=float)
     parser.add_argument("--real-like-aspect-max", default=1.65, type=float)
     parser.add_argument("--real-like-hfrac-min", default=0.52, type=float)
     parser.add_argument("--real-like-hfrac-max", default=0.82, type=float)
+    parser.add_argument("--real-roi-shape-filter", action="store_true", default=True)
+    parser.add_argument("--no-real-roi-shape-filter", dest="real_roi_shape_filter", action="store_false")
+    parser.add_argument("--real-roi-aspect-min", default=0.90, type=float)
+    parser.add_argument("--real-roi-aspect-max", default=1.75, type=float)
+    parser.add_argument("--real-roi-front-aspect-min", default=0.82, type=float)
+    parser.add_argument("--real-roi-front-aspect-max", default=1.45, type=float)
     parser.add_argument("--multi-face-filter", action="store_true", default=True)
     parser.add_argument("--no-multi-face-filter", dest="multi_face_filter", action="store_false")
     parser.add_argument("--top-face-weight-max", default=0.52, type=float)
@@ -1016,7 +1175,7 @@ def main():
         "labels_my-project-name_2026-05-25-03-59-55.csv",
         "labels_my-project-name_2026-05-25-11-21-48.csv",
     ])
-    parser.add_argument("--corner-shape-filter", action="store_true", default=True)
+    parser.add_argument("--corner-shape-filter", action="store_true", default=False)
     parser.add_argument("--no-corner-shape-filter", dest="corner_shape_filter", action="store_false")
     parser.add_argument("--corner-shape-max-dist", default=0.90, type=float)
     parser.add_argument("--corner-shape-target-mode", default="nearest", choices=["cycle", "nearest"])
@@ -1121,8 +1280,16 @@ def main():
             random.uniform(-10, 10),
         )
 
-        sample_no = attempts - 1
+        sample_no = args.start_index + idx
+        # Keep the final output index for front/side scheduling, but let side
+        # templates rotate across rejected attempts so strict shape filtering
+        # does not get stuck on one impossible direction.
+        direction_sample_no = sample_no
+        if args.view_mode == "front_then_sides" and sample_no % 16 >= 3:
+            direction_sample_no = 3 + ((attempts - 1) % 16)
+        roi_side = post3s_roi_side(sample_no) if args.view_mode == "front_then_sides" else None
         target_shape = None
+        sample_background_dir = select_background_dir(args, sample_no)
         if args.view_mode == "real_corner_shapes" and real_shape_bank and args.corner_shape_target_mode == "cycle":
             target_shape = real_shape_bank[sample_no % len(real_shape_bank)]
         if args.orbit_camera and args.view_mode == "balanced_faces":
@@ -1140,8 +1307,10 @@ def main():
                 direction = tilted_side_face_camera_direction(sample_no, jitter=args.view_jitter)
             elif args.view_mode == "tilted_screen_front":
                 direction = tilted_screen_front_camera_direction(sample_no, jitter=args.view_jitter)
+            elif args.ymin_heavy:
+                direction = ymin_side_camera_direction(direction_sample_no, jitter=args.view_jitter, roi_side=roi_side)
             else:
-                direction = front_then_side_camera_direction(sample_no, jitter=args.view_jitter)
+                direction = front_then_side_camera_direction(direction_sample_no, jitter=args.view_jitter, roi_side=roi_side)
             direction = (obj.matrix_world.to_3x3() @ direction).normalized()
             radius = random.uniform(args.camera_radius_min, args.camera_radius_max)
             cam.location = obj.location + direction * radius
@@ -1181,10 +1350,35 @@ def main():
         bpy.context.view_layer.update()
 
         world_corners = [obj.matrix_world @ c for c in local_corners]
+        if args.view_mode == "front_then_sides" and sample_no % 16 >= 3:
+            keep_zmin_face_down(scene, cam, world_corners)
+            sync_camera_softbox(camera_softbox, cam, obj.location)
+            bpy.context.view_layer.update()
         corners_2d = []
         for c in world_corners:
             co = bpy_extras.object_utils.world_to_camera_view(scene, cam, c)
             corners_2d.append([float(co.x * args.width), float((1.0 - co.y) * args.height), float(co.z)])
+
+        if args.view_mode == "front_then_sides" and args.real_roi_shape_filter:
+            if not args.ymin_heavy:
+                if not real_roi_shape_ok(
+                    corners_2d,
+                    sample_no,
+                    args.width,
+                    args.height,
+                    args.real_roi_aspect_min,
+                    args.real_roi_aspect_max,
+                    args.real_roi_front_aspect_min,
+                    args.real_roi_front_aspect_max,
+                ):
+                    continue
+            if roi_side is not None:
+                _face_weights, ranked_faces = face_weights_from_corners(corners_2d)
+                expected_face = "y_min" if args.ymin_heavy else ("x_max" if roi_side == "left" else "x_min")
+                top_n = 2 if args.ymin_heavy else 3
+                top_faces = {ranked_faces[i][0] for i in range(top_n)}
+                if expected_face not in top_faces:
+                    continue
 
         points = np.array([[p[0], p[1]] for p in corners_2d], dtype=np.float32)
         margin = 8
@@ -1270,10 +1464,10 @@ def main():
             cam_fy = args.fy * crop_info["scale_y"]
             cam_cx = (args.cx - x1) * crop_info["scale_x"] + crop_info.get("pad_x", 0.0)
             cam_cy = (args.cy - y1) * crop_info["scale_y"] + crop_info.get("pad_y", 0.0)
-            if args.background_dir:
-                composite_cropped_foreground_on_background(final_path, args.background_dir)
-        elif args.background_dir:
-            composite_on_background(final_path, args.background_dir)
+            if sample_background_dir:
+                composite_cropped_foreground_on_background(final_path, sample_background_dir)
+        elif sample_background_dir:
+            composite_on_background(final_path, sample_background_dir)
 
         record = {
             "image": f"rgb/{stem}.png",
@@ -1295,6 +1489,7 @@ def main():
             },
             "object_location": [float(v) for v in obj.location],
             "object_rotation_euler": [float(v) for v in obj.rotation_euler],
+            "background_dir": None if sample_background_dir is None else str(sample_background_dir),
         }
         if args.view_mode == "real_corner_shapes":
             if nearest_shape is not None:

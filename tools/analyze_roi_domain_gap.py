@@ -61,11 +61,13 @@ def make_contact_sheet(items, out_path, thumb=(256, 256), cols=6):
     cv2.imwrite(str(out_path), sheet)
 
 
-def collect_synth(root, count, image_size, roi_pad, roi_jitter):
+def collect_synth(root, count, image_size, roi_pad, roi_jitter, start_index=0, sample_step=1):
     root = Path(root)
     rows = []
     tiles = []
-    for lp in sorted((root / "labels").glob("*.json"))[:count]:
+    label_paths = sorted((root / "labels").glob("*.json"))
+    selected = label_paths[start_index::max(1, sample_step)][:count]
+    for lp in selected:
         rec = json.loads(lp.read_text(encoding="utf-8"))
         img = cv2.imread(str(root / rec["image"]), cv2.IMREAD_COLOR)
         if img is None:
@@ -92,14 +94,18 @@ def collect_synth(root, count, image_size, roi_pad, roi_jitter):
     return rows, tiles
 
 
-def collect_real(video, detector_path, frame_count, stride, image_size, conf, iou, roi_pad, max_rois):
+def collect_real(video, detector_path, frame_count, stride, image_size, conf, iou, roi_pad, max_rois, start_frame=0):
     detector = YOLO(detector_path)
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open {video}")
     rows = []
     tiles = []
-    frame_idx = written = 0
+    start_frame = max(0, int(start_frame))
+    if start_frame:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frame_idx = start_frame
+    written = 0
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -187,8 +193,12 @@ def main():
     ap.add_argument("--detector", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--synth-count", type=int, default=400)
+    ap.add_argument("--synth-start-index", type=int, default=0)
+    ap.add_argument("--synth-sample-step", type=int, default=1)
     ap.add_argument("--real-frames", type=int, default=160)
     ap.add_argument("--real-stride", type=int, default=3)
+    ap.add_argument("--real-start-frame", type=int, default=0)
+    ap.add_argument("--real-start-sec", type=float)
     ap.add_argument("--image-size", type=int, default=256)
     ap.add_argument("--roi-pad", type=float, default=0.08)
     ap.add_argument("--roi-jitter", type=float, default=0.0)
@@ -199,8 +209,33 @@ def main():
 
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
-    synth_rows, synth_tiles = collect_synth(args.synth_root, args.synth_count, args.image_size, args.roi_pad, args.roi_jitter)
-    real_rows, real_tiles = collect_real(args.video, args.detector, args.real_frames, args.real_stride, args.image_size, args.det_conf, args.det_iou, args.roi_pad, args.max_rois)
+    real_start_frame = args.real_start_frame
+    if args.real_start_sec is not None:
+        cap = cv2.VideoCapture(str(args.video))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+        real_start_frame = int(round(args.real_start_sec * fps))
+    synth_rows, synth_tiles = collect_synth(
+        args.synth_root,
+        args.synth_count,
+        args.image_size,
+        args.roi_pad,
+        args.roi_jitter,
+        args.synth_start_index,
+        args.synth_sample_step,
+    )
+    real_rows, real_tiles = collect_real(
+        args.video,
+        args.detector,
+        args.real_frames,
+        args.real_stride,
+        args.image_size,
+        args.det_conf,
+        args.det_iou,
+        args.roi_pad,
+        args.max_rois,
+        real_start_frame,
+    )
     make_contact_sheet(synth_tiles, out_dir / "synth_train_roi_contact_sheet.png")
     make_contact_sheet(real_tiles, out_dir / "real_yolo_roi_contact_sheet.png")
     report = {
@@ -208,6 +243,9 @@ def main():
         "video": args.video,
         "detector": args.detector,
         "roi_pad": args.roi_pad,
+        "synth_start_index": args.synth_start_index,
+        "synth_sample_step": args.synth_sample_step,
+        "real_start_frame": real_start_frame,
         "synth_summary": summarize_rows(synth_rows),
         "real_summary": summarize_rows(real_rows),
         "mean_delta_real_minus_synth": {
