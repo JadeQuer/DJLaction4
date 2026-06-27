@@ -157,6 +157,7 @@ def infer(args):
                     keep_aspect=not args.stretch_roi,
                     return_meta=True,
                     coord_conv=args.coord_conv,
+                    input_lowres_size=args.input_lowres_size,
                 )
                 inp = inp.to(device)
                 logits = model(inp)
@@ -205,6 +206,7 @@ def infer(args):
         'decode_mode': args.decode_mode,
         'decode_topk': args.decode_topk,
         'softargmax_temperature': args.softargmax_temperature,
+        'input_lowres_size': args.input_lowres_size,
     }
     Path(args.out).with_suffix('.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps(report, indent=2))
@@ -229,9 +231,10 @@ def main():
     ap.add_argument('--stretch-roi', action='store_true')
     ap.add_argument('--debug-dir')
     ap.add_argument('--debug-frames', type=int, default=24)
-    ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap'])
+    ap.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap', 'betr_heatmap'])
     ap.add_argument('--coord-conv', action='store_true')
     ap.add_argument('--token-mixer', action='store_true')
+    ap.add_argument('--input-lowres-size', type=int, default=0, help='Downsample each network input to this max side then upsample back; 0 disables.')
     ap.add_argument('--decode-mode', default='topk_mean', choices=['topk_mean', 'argmax', 'softargmax'])
     ap.add_argument('--decode-topk', type=int, default=9)
     ap.add_argument('--softargmax-temperature', type=float, default=0.05)

@@ -82,6 +82,57 @@ def append_coord_channels(img):
     return np.concatenate([img, grid_x[:, :, None], grid_y[:, :, None]], axis=2)
 
 
+def apply_lowres_resample(img, lowres_size=0):
+    lowres_size = int(lowres_size or 0)
+    if lowres_size <= 0:
+        return img
+    h, w = img.shape[:2]
+    lowres_size = max(8, min(lowres_size, max(h, w)))
+    scale = lowres_size / float(max(h, w))
+    small_w = max(8, int(round(w * scale)))
+    small_h = max(8, int(round(h * scale)))
+    small = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def normalize_bgr_for_network(img_bgr):
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img = img_rgb.astype(np.float32) / 255.0
+    img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    return img
+
+
+def apply_zoom_out_canvas(img, corners, min_scale=1.0, fill=None):
+    min_scale = float(min_scale or 1.0)
+    if min_scale >= 0.999:
+        return img, corners
+    h, w = img.shape[:2]
+    scale = float(np.random.uniform(max(0.25, min_scale), 1.0))
+    if scale >= 0.999:
+        return img, corners
+    new_w = max(8, int(round(w * scale)))
+    new_h = max(8, int(round(h * scale)))
+    small = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if fill is None:
+        border = np.concatenate([
+            img[: max(1, h // 12)].reshape(-1, 3),
+            img[h - max(1, h // 12):].reshape(-1, 3),
+            img[:, : max(1, w // 12)].reshape(-1, 3),
+            img[:, w - max(1, w // 12):].reshape(-1, 3),
+        ], axis=0)
+        fill = tuple(int(v) for v in np.median(border, axis=0))
+    canvas = np.full_like(img, fill)
+    max_x = max(0, w - new_w)
+    max_y = max(0, h - new_h)
+    off_x = int(np.random.randint(0, max_x + 1)) if max_x > 0 else 0
+    off_y = int(np.random.randint(0, max_y + 1)) if max_y > 0 else 0
+    canvas[off_y:off_y + new_h, off_x:off_x + new_w] = small
+    out_corners = corners.copy()
+    out_corners[:, 0] = out_corners[:, 0] * (new_w / float(w)) + off_x
+    out_corners[:, 1] = out_corners[:, 1] * (new_h / float(h)) + off_y
+    return canvas, out_corners
+
+
 def crop_and_resize(img, bbox, out_size, keep_aspect=True):
     x1, y1, x2, y2 = bbox
     x1i, y1i = int(np.floor(x1)), int(np.floor(y1))
@@ -200,6 +251,8 @@ class CornerDataset(Dataset):
         aug=True,
         geometry_aug=False,
         coord_conv=False,
+        input_lowres_size=0,
+        zoom_out_min_scale=1.0,
     ):
         self.root = Path(root)
         self.labels = sorted((self.root / 'labels').glob('*.json'))
@@ -215,6 +268,8 @@ class CornerDataset(Dataset):
         self.aug = aug
         self.geometry_aug = geometry_aug
         self.coord_conv = coord_conv
+        self.input_lowres_size = int(input_lowres_size or 0)
+        self.zoom_out_min_scale = float(zoom_out_min_scale or 1.0)
         if not self.labels:
             raise RuntimeError(f'No labels found under {self.root / "labels"}')
 
@@ -269,8 +324,11 @@ class CornerDataset(Dataset):
             img = apply_image_augment(img)
         if self.geometry_aug and self.train:
             img = apply_geometry_augment(img, corners)
-        img = img.astype(np.float32) / 255.0
-        img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        if self.train and self.zoom_out_min_scale < 0.999:
+            img, corners = apply_zoom_out_canvas(img, corners, self.zoom_out_min_scale)
+        if self.input_lowres_size > 0:
+            img = apply_lowres_resample(img, self.input_lowres_size)
+        img = normalize_bgr_for_network(img)
         if self.coord_conv:
             img = append_coord_channels(img)
         img = img.transpose(2, 0, 1)
@@ -336,6 +394,139 @@ class SpatialTokenMixer(nn.Module):
         x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)[0]
         x = x + self.mlp(self.norm2(x))
         return x.transpose(1, 2).reshape(b, c, h, w)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        orig_dtype = x.dtype
+        x_float = x.float()
+        x_norm = x_float * torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x_norm.to(orig_dtype) * self.weight)
+
+
+class QKNormSelfAttention(nn.Module):
+    def __init__(self, dim=256, num_heads=8, dropout=0.0):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f'dim={dim} must be divisible by num_heads={num_heads}')
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        b, n, c = x.shape
+        qkv = self.qkv(x).view(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            scale=self.scale,
+        )
+        x = x.transpose(1, 2).reshape(b, n, c)
+        return self.proj_drop(self.proj(x))
+
+
+class BETRBlock(nn.Module):
+    def __init__(self, dim=256, num_heads=8, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = QKNormSelfAttention(dim=dim, num_heads=num_heads, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class BETRHeatmapNet(nn.Module):
+    def __init__(
+        self,
+        out_channels=8,
+        heatmap_size=128,
+        coord_conv=False,
+        dim=256,
+        patch_stride=8,
+        out_patch_size=4,
+        depth=6,
+        num_heads=8,
+    ):
+        super().__init__()
+        if heatmap_size != 128:
+            raise ValueError('BETRHeatmapNet currently expects heatmap_size=128')
+        in_channels = 5 if coord_conv else 3
+        self.patch_stride = patch_stride
+        self.out_patch_size = out_patch_size
+        self.num_keypoints = out_channels
+        self.output_wh = (heatmap_size, heatmap_size)
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(in_channels, dim // 2, kernel_size=7, stride=4, padding=3, bias=False),
+            _make_group_norm(dim // 2),
+            nn.GELU(),
+            ResidualConvBlock(dim // 2, dim // 2),
+            nn.Conv2d(dim // 2, dim, kernel_size=3, stride=2, padding=1, bias=False),
+            _make_group_norm(dim),
+            nn.GELU(),
+            ResidualConvBlock(dim, dim),
+        )
+        self.input_transform = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(dim, dim),
+        )
+        self.input_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.bbox_query = nn.Parameter(torch.zeros(1, 1, dim))
+        self.blocks = nn.ModuleList([BETRBlock(dim=dim, num_heads=num_heads) for _ in range(depth)])
+        self.output_norm = nn.LayerNorm(dim)
+        self.bbox_proj = nn.Linear(dim, out_patch_size * out_patch_size * out_channels)
+
+    def _unpatchify(self, patch_values, grid_h, grid_w):
+        b = patch_values.shape[0]
+        p = self.out_patch_size
+        k = self.num_keypoints
+        patch_values = patch_values.view(b, grid_h, grid_w, p, p, k)
+        patch_values = patch_values.permute(0, 5, 1, 3, 2, 4)
+        return patch_values.reshape(b, k, grid_h * p, grid_w * p)
+
+    def forward(self, x):
+        feat = self.patch_embed(x)
+        b, c, h, w = feat.shape
+        tokens = feat.flatten(2).transpose(1, 2)
+        tokens = self.input_norm(self.input_transform(tokens))
+        pos = build_2d_sincos_pos_embed(h, w, c, feat.device, feat.dtype)
+        tokens = tokens + pos + self.bbox_query.to(dtype=tokens.dtype)
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.output_norm(tokens)
+        patch_logits = self.bbox_proj(tokens)
+        heatmaps = self._unpatchify(patch_logits, h, w)
+        if heatmaps.shape[-2:] != self.output_wh:
+            heatmaps = F.interpolate(heatmaps, size=self.output_wh, mode='bilinear', align_corners=False)
+        return heatmaps
 
 
 
@@ -408,6 +599,13 @@ class TeacherHeatmapNet(nn.Module):
             ResidualConvBlock(base_channels * 2, base_channels * 2),
             ResidualConvBlock(base_channels * 2, base_channels * 2),
         )
+        self.refine128 = nn.Identity()
+        if heatmap_size >= 128:
+            self.refine128 = nn.Sequential(
+                nn.Upsample(size=(heatmap_size, heatmap_size), mode='bilinear', align_corners=False),
+                ResidualConvBlock(base_channels * 2, base_channels * 2),
+                ResidualConvBlock(base_channels * 2, base_channels * 2),
+            )
         self.head = nn.Sequential(
             nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1, bias=False),
             _make_group_norm(base_channels),
@@ -421,6 +619,7 @@ class TeacherHeatmapNet(nn.Module):
         feat32 = self.stage2(feat64)
         up64 = F.interpolate(self.neck(feat32), size=feat64.shape[-2:], mode='bilinear', align_corners=False)
         fused = self.fuse(torch.cat([feat64, up64], dim=1))
+        fused = self.refine128(fused)
         heatmaps = self.head(fused)
         if heatmaps.shape[-2:] != self.output_wh:
             heatmaps = F.interpolate(heatmaps, size=self.output_wh, mode='bilinear', align_corners=False)
@@ -509,6 +708,8 @@ class ResNetCornerNet(nn.Module):
 def build_pose_model(backbone, pretrained, heatmap_size, coord_conv=False, token_mixer=False):
     if backbone == 'teacher_heatmap':
         return TeacherHeatmapNet(out_channels=8, heatmap_size=heatmap_size, coord_conv=coord_conv, base_channels=48)
+    if backbone == 'betr_heatmap':
+        return BETRHeatmapNet(out_channels=8, heatmap_size=heatmap_size, coord_conv=coord_conv)
     return ResNetCornerNet(
         backbone=backbone,
         pretrained=pretrained,
@@ -627,7 +828,7 @@ def decode_heatmaps(logits, topk=9, mode='topk_mean', temperature=0.05):
     return np.array(pts, dtype=np.float32), np.array(conf, dtype=np.float32)
 
 
-def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_meta=False, coord_conv=False):
+def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_meta=False, coord_conv=False, input_lowres_size=0):
     if keep_aspect:
         img_u8, meta = resize_letterbox(frame, image_size)
     else:
@@ -640,8 +841,8 @@ def preprocess_frame(frame, image_size=(256, 256), keep_aspect=False, return_met
             'out_w': int(image_size[0]),
             'out_h': int(image_size[1]),
         }
-    img = img_u8.astype(np.float32) / 255.0
-    img = (img - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_u8 = apply_lowres_resample(img_u8, input_lowres_size)
+    img = normalize_bgr_for_network(img_u8)
     if coord_conv:
         img = append_coord_channels(img)
     tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0)
@@ -684,6 +885,8 @@ def train(args):
         aug=args.augment,
         geometry_aug=args.geometry_augment,
         coord_conv=args.coord_conv,
+        input_lowres_size=args.input_lowres_size,
+        zoom_out_min_scale=args.zoom_out_min_scale,
     )
     val_base = CornerDataset(
         args.data,
@@ -699,6 +902,8 @@ def train(args):
         aug=False,
         geometry_aug=False,
         coord_conv=args.coord_conv,
+        input_lowres_size=args.input_lowres_size,
+        zoom_out_min_scale=1.0,
     )
     total = len(train_base)
     n_val = max(1, int(total * 0.15))
@@ -853,7 +1058,12 @@ def infer_video(args):
             if frame_idx % args.stride != 0:
                 frame_idx += 1
                 continue
-            x = preprocess_frame(frame, image_size=(args.image_size, args.image_size), coord_conv=args.coord_conv).to(device)
+            x = preprocess_frame(
+                frame,
+                image_size=(args.image_size, args.image_size),
+                coord_conv=args.coord_conv,
+                input_lowres_size=args.input_lowres_size,
+            ).to(device)
             logits = model(x)
             pts, conf = decode_heatmaps(logits, topk=args.decode_topk, mode=args.decode_mode, temperature=args.softargmax_temperature)
             vis = frame.copy()
@@ -897,7 +1107,7 @@ def main():
     p.add_argument('--scheduler', default='none', choices=['none', 'cosine'])
     p.add_argument('--warmup-steps', type=int, default=0)
     p.add_argument('--min-lr', type=float, default=1e-6)
-    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap'])
+    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap', 'betr_heatmap'])
     p.add_argument('--image-size', type=int, default=256)
     p.add_argument('--heatmap-size', type=int, default=64)
     p.add_argument('--sigma', type=float, default=1.8)
@@ -912,6 +1122,8 @@ def main():
     p.add_argument('--no-pretrained', action='store_true')
     p.add_argument('--coord-conv', action='store_true')
     p.add_argument('--token-mixer', action='store_true')
+    p.add_argument('--input-lowres-size', type=int, default=0, help='Downsample each network input to this max side then upsample back; 0 disables.')
+    p.add_argument('--zoom-out-min-scale', type=float, default=1.0, help='Training-only random zoom-out lower bound; 1 disables.')
     p.add_argument('--decode-mode', default='topk_mean', choices=['topk_mean', 'argmax', 'softargmax'])
     p.add_argument('--decode-topk', type=int, default=9)
     p.add_argument('--softargmax-temperature', type=float, default=0.05)
@@ -932,11 +1144,12 @@ def main():
     p.add_argument('--stride', type=int, default=3)
     p.add_argument('--max-frames', type=int, default=300)
     p.add_argument('--output-width', type=int, default=960)
-    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap'])
+    p.add_argument('--backbone', default='resnet18', choices=['resnet18', 'resnet34', 'resnet18_dilated', 'resnet34_dilated', 'teacher_heatmap', 'betr_heatmap'])
     p.add_argument('--image-size', type=int, default=256)
     p.add_argument('--heatmap-size', type=int, default=64)
     p.add_argument('--coord-conv', action='store_true')
     p.add_argument('--token-mixer', action='store_true')
+    p.add_argument('--input-lowres-size', type=int, default=0, help='Downsample each network input to this max side then upsample back; 0 disables.')
     p.add_argument('--decode-mode', default='topk_mean', choices=['topk_mean', 'argmax', 'softargmax'])
     p.add_argument('--decode-topk', type=int, default=9)
     p.add_argument('--softargmax-temperature', type=float, default=0.05)

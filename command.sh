@@ -20,6 +20,7 @@
   --heatmap-size 128 \
   --roi-pad 0.08
 
+#相对还行的一版
 /root/autodl-tmp/DJLaction4/.conda_djiaction4/bin/python tools/corner_pose_resnet.py train \
   --data datasets/dji_action4_rich_views_aug_train_600 \
   --out runs/corner_teacher_heatmap_hm128_rich_views_aug_600_geo_reproduce \
@@ -51,3 +52,6 @@
   --heatmap-size 128 \
   --roi-pad 0.08 \
   --decode-mode argmax
+
+#生成600张训练数据
+OMP_NUM_THREADS=1 /root/autodl-tmp/DJLaction4/.conda_djiaction4/bin/python tools/render_corner_dataset.py --out-dir datasets/dji_action4_rich_views_aug_train_600 --num-images 85 --start-index 515 --append
